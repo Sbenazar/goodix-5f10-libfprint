@@ -1,91 +1,95 @@
+# libfprint -- Goodix 27c6:5F10 driver
 
+A libfprint driver for the Goodix `27c6:5F10` fingerprint sensor -- the patch-style
+reader that ships in HONOR MagicBook laptops and shows up as
+`USB\VID_27C6&PID_5F10`. This repo is a full libfprint tree with one extra driver
+on top; everything else is stock
+[libfprint](https://gitlab.freedesktop.org/libfprint/libfprint).
 
-<div align="center">
+> **Status: builds, not yet tested on real hardware.** I wrote and reverse-engineered
+> this against my own machine's traffic, but I don't have a second 5F10 to confirm
+> enroll/verify accross devices. If you own one of these sensors, a testing report is
+> exactly what I'm after before this goes upstream -- see [Testing](#testing).
 
-# LibFPrint
+## The sensor
 
-This is an experimental libfprint driver implementation for Goodix drivers.
+The 5F10 is a tiny 56x176 image sensor. It is too small for NBIS minutiae matching
+(the same wall the Goodix HTK32 hits), so the driver is not a normal
+`FpImageDevice`. Instead it:
 
-Currently in the works:
-- 27c6x5110 (80x64 resolution)
+- talks to the chip over the goodixtls TLS-PSK transport (OpenSSL),
+- captures raw frames and matches them host-side with sigfm (FAST-9 + BRIEF-256 + RANSAC),
+- keeps a small gallery of raw frames in the `FpPrint`.
 
-*LibFPrint is part of the **[FPrint][Website]** project.*
+That "FpDevice + host-side sigfm + raw-frame gallery" shape is taken from AndyHazz's
+goodix53x5 driver -- see [Credits](#credits).
 
-<br/>
+| | |
+|---|---|
+| Sensor | Goodix `27c6:5F10` (ST411SEC), 56x176 |
+| Firmware | `GF_ST411SEC_APP_12705` |
+| Laptops | HONOR MagicBook family |
+| Matcher | pure-C sigfm (FAST-9 + BRIEF-256 + RANSAC), no OpenCV |
+| Transport | goodixtls, TLS 1.2 PSK (OpenSSL) |
 
-[![Button Website]][Website]
-[![Button Documentation]][Documentation]
+## The catch: per-device PSK
 
-[![Button Supported]][Supported]
-[![Button Unsupported]][Unsupported]
+The 5F10 only speaks TLS, and only with a per-device PSK that the factory
+provisions. That key is not in this code and cannot be derived from scratch on
+Linux. On a dual-boot machine you can recover the one Windows already holds with
+the companion tool:
 
-[![Button Contribute]][Contribute]
-[![Button Contributors]][Contributors]
+-> **[goodix-5f10-psk](https://github.com/Sbenazar/goodix-5f10-psk)**
 
-</div>
+It reads the key offline and read-only off the Windows partition and drops it at
+`/var/lib/fprint/goodix-5f10/psk`. Without that file the driver fails activation
+with a clear message telling you where to put it.
 
-## History
+## Build
 
-**LibFPrint** was originally developed as part of an
-academic project at the **[University Of Manchester]**.
+Verified with meson 1.11 / gcc 16 / libfprint 1.94.5:
 
-It aimed to hide the differences between consumer
-fingerprint scanners and provide a single uniform
-API to application developers.
+```sh
+meson setup build -Ddrivers=goodixtls5f10 -Ddoc=false -Dgtk-examples=false -Dintrospection=false
+ninja -C build
+```
 
-## Goal
+`./build/libfprint/fprint-list-supported-devices` should then list `27c6:5f10`.
 
-The ultimate goal of the **FPrint** project is to make
-fingerprint scanners widely and easily usable under
-common Linux environments.
+## Enroll & verify
+
+```sh
+# 1. put the recovered PSK in place (see goodix-5f10-psk)
+sudo systemctl restart fprintd
+fprintd-enroll
+fprintd-verify
+```
+
+## Testing
+
+This is where you come in. I'm gathering reports before opening an upstream MR.
+If you have a 5F10:
+
+1. `lsusb | grep 27c6:5f10` to confirm the sensor.
+2. Recover the PSK with [goodix-5f10-psk](https://github.com/Sbenazar/goodix-5f10-psk).
+3. Build (above), enroll, verify.
+4. Paste your `G_MESSAGES_DEBUG=all fprintd` log into libfprint issue
+   [#735](https://gitlab.freedesktop.org/libfprint/libfprint/-/issues/735), or open
+   an issue here. Good or bad, both are useful.
+
+## Credits
+
+This stands on a stack of prior work:
+
+- the **goodixtls** TLS transport and protocol base from
+  [goodix-fp-linux-dev](https://github.com/goodix-fp-linux-dev/libfprint);
+- the pure-C **sigfm** port from
+  [buxel](https://github.com/buxel/libfprint-27c6-5110), which in turn comes from
+  the original sigfm authors (Matthieu Charette, Natasha England-Elbro, Timur
+  Mangliev);
+- the `FpDevice` host-side-matching **architecture** from
+  [AndyHazz/goodix53x5-libfprint](https://github.com/AndyHazz/goodix53x5-libfprint).
 
 ## License
 
-`Section 6` of the license states that for compiled works that use
-this library, such works must include **LibFPrint** copyright notices
-alongside the copyright notices for the other parts of the work.
-
-**LibFPrint** includes code from **NIST's** **[NBIS]** software distribution.
-
-We include **Bozorth3** from the **[US Export Controlled]**
-distribution, which we have determined to be fine
-being shipped in an open source project.
-
-<br/>
-
-<div align="right">
-
-[![Badge License]][License]
-
-</div>
-
-
-<!----------------------------------------------------------------------------->
-
-[Documentation]: https://fprint.freedesktop.org/libfprint-dev/
-[Contributors]: https://gitlab.freedesktop.org/libfprint/libfprint/-/graphs/master
-[Unsupported]: https://gitlab.freedesktop.org/libfprint/wiki/-/wikis/Unsupported-Devices
-[Supported]: https://fprint.freedesktop.org/supported-devices.html
-[Website]: https://fprint.freedesktop.org/
-
-[Contribute]: ./HACKING.md
-[License]: ./COPYING
-
-[University Of Manchester]: https://www.manchester.ac.uk/
-[US Export Controlled]: https://fprint.freedesktop.org/us-export-control.html
-[NBIS]: http://fingerprint.nist.gov/NBIS/index.html
-
-
-<!---------------------------------[ Badges ]---------------------------------->
-
-[Badge License]: https://img.shields.io/badge/License-LGPL2.1-015d93.svg?style=for-the-badge&labelColor=blue
-
-
-<!---------------------------------[ Buttons ]--------------------------------->
-
-[Button Documentation]: https://img.shields.io/badge/Documentation-04ACE6?style=for-the-badge&logoColor=white&logo=BookStack
-[Button Contributors]: https://img.shields.io/badge/Contributors-FF4F8B?style=for-the-badge&logoColor=white&logo=ActiGraph
-[Button Unsupported]: https://img.shields.io/badge/Unsupported_Devices-EF2D5E?style=for-the-badge&logoColor=white&logo=AdBlock
-[Button Contribute]: https://img.shields.io/badge/Contribute-66459B?style=for-the-badge&logoColor=white&logo=Git
-[Button Supported]: https://img.shields.io/badge/Supported_Devices-428813?style=for-the-badge&logoColor=white&logo=AdGuard
-[Button Website]: https://img.shields.io/badge/Homepage-3B80AE?style=for-the-badge&logoColor=white&logo=freedesktopDotOrg
+LGPL-2.1-or-later, same as libfprint.
