@@ -47,6 +47,16 @@ typedef struct _GoodixTlsServer
 } GoodixTlsServer;
 
 /**
+ * @brief Set the TLS session PSK used by the server callback.
+ *  Defaults to 32 zero bytes (upstream-provisioned chips). Call before TLS init
+ *  for chips carrying a device-specific session PSK (e.g. 5F10).
+ *
+ * @param psk PSK bytes
+ * @param len length of the PSK
+ */
+void goodix_tls_set_psk (const guint8 *psk, unsigned int len);
+
+/**
  * @brief Initalise the server
  *
  * @param self context to init

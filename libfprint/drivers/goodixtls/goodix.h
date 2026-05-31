@@ -25,14 +25,18 @@
 // 1 seconds USB timeout
 #define GOODIX_TIMEOUT (1000)
 
+// Base type is a plain FpDevice (NOT FpImageDevice): the 5F10 driver does its own
+// enroll/verify with SIFT-based matching (sigfm), not libfprint's built-in NBIS image
+// matcher. goodix.c only ever uses FpDevice-level APIs, so this change is transparent
+// to it. The old FpImageDevice scan layer (goodix5xx.c / goodix511.c) was removed.
 G_DECLARE_DERIVABLE_TYPE (FpiDeviceGoodixTls, fpi_device_goodixtls, FPI,
-                          DEVICE_GOODIXTLS, FpImageDevice)
+                          DEVICE_GOODIXTLS, FpDevice)
 
 #define FPI_TYPE_DEVICE_GOODIXTLS (fpi_device_goodixtls_get_type ())
 
 struct _FpiDeviceGoodixTlsClass
 {
-  FpImageDeviceClass parent;
+  FpDeviceClass parent;
 
   gint               interface;
   guint8             ep_in;
@@ -138,12 +142,6 @@ void goodix_receive_preset_psk_read (FpDevice *dev,
                                      guint16   length,
                                      gpointer  user_data,
                                      GError   *error);
-
-void goodix_receive_preset_psk_write (FpDevice *dev,
-                                      guint8   *data,
-                                      guint16   length,
-                                      gpointer  user_data,
-                                      GError   *error);
 
 void goodix_receive_ack (FpDevice *dev,
                          guint8   *data,
@@ -441,25 +439,6 @@ void goodix_send_tls_successfully_established (FpDevice          *dev,
                                                gpointer           user_data);
 
 /**
- * @brief Set the device preset psk. May not work for all device firmware versions
- *
- * @param dev
- * @param flags
- * @param psk
- * @param length
- * @param free_func
- * @param callback
- * @param user_data
- */
-void goodix_send_preset_psk_write (FpDevice             *dev,
-                                   guint32               flags,
-                                   guint8               *psk,
-                                   guint16               length,
-                                   GDestroyNotify        free_func,
-                                   GoodixSuccessCallback callback,
-                                   gpointer              user_data);
-
-/**
  * @brief Ask the device what preset psk it has
  *
  * @param dev
@@ -516,6 +495,14 @@ gboolean goodix_dev_deinit (FpDevice *dev,
  * @param dev
  */
 void goodix_reset_state (FpDevice *dev);
+
+/**
+ * @brief Cancel an in-flight USB transfer (aborts a read blocked waiting for a finger).
+ *        The pending transfer fails with G_IO_ERROR_CANCELLED and the active SSM unwinds.
+ *
+ * @param dev
+ */
+void goodix_cancel (FpDevice *dev);
 
 // ---- DEV SECTION END ----
 

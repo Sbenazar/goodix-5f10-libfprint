@@ -60,7 +60,7 @@ typedef struct
 } FpiDeviceGoodixTlsPrivate;
 
 G_DEFINE_ABSTRACT_TYPE_WITH_PRIVATE (FpiDeviceGoodixTls, fpi_device_goodixtls,
-                                     FP_TYPE_IMAGE_DEVICE);
+                                     FP_TYPE_DEVICE);
 
 // TODO remove every GDestroyNotify
 // TODO add cmd timeouts
@@ -221,31 +221,6 @@ goodix_receive_preset_psk_read (FpDevice *dev, guint8 *data, guint16 length,
             GUINT32_FROM_LE (((GoodixPresetPsk *) (data + sizeof (guint8)))->flags),
             data + sizeof (guint8) + sizeof (GoodixPresetPsk), psk_len,
             cb_info->user_data, NULL);
-}
-
-void
-goodix_receive_preset_psk_write (FpDevice *dev, guint8 *data,
-                                 guint16 length, gpointer user_data,
-                                 GError *error)
-{
-  g_autofree GoodixCallbackInfo *cb_info = user_data;
-  GoodixSuccessCallback callback = (GoodixSuccessCallback) cb_info->callback;
-
-  if (error)
-    {
-      callback (dev, FALSE, cb_info->user_data, error);
-      return;
-    }
-
-  if (length < sizeof (guint8))
-    {
-      g_set_error (&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                   "Invalid preset PSK write reply length: %d", length);
-      callback (dev, FALSE, cb_info->user_data, error);
-      return;
-    }
-
-  callback (dev, data[0] == 0x00 ? TRUE : FALSE, cb_info->user_data, NULL);
 }
 
 void
@@ -424,7 +399,27 @@ goodix_receive_data_cb (FpiUsbTransfer *transfer, FpDevice *dev,
 
   if (g_cancellable_is_cancelled (priv->transfer_cancel_tkn))
     {
-      fp_dbg ("transfer cancelled, aborting read loop...");
+      fp_dbg ("transfer cancelled");
+      g_clear_error (&error); // we own the transfer's cancelled error
+
+      // Fail any command currently awaiting a reply so its SSM unwinds to *_complete
+      // (mirrors goodix_receive_timeout_cb). Without this, an operation parked in a
+      // no-timeout read (e.g. waiting for a finger) would hang forever on cancel.
+      if (priv->ack || priv->reply)
+        {
+          GError *cancelled = g_error_new (G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                                           "transfer cancelled");
+          goodix_receive_done (dev, NULL, 0, cancelled);
+        }
+
+      // Keep the persistent read loop alive for later operations on the same open device.
+      // During teardown goodix_dev_deinit cancels the token and then clears priv->inited
+      // (synchronously, before this async callback runs), so we skip re-arming there.
+      if (priv->inited)
+        {
+          g_cancellable_reset (priv->transfer_cancel_tkn);
+          goodix_receive_data (dev);
+        }
       return;
     }
   if (error)
@@ -1083,42 +1078,6 @@ goodix_send_read_otp (FpDevice *dev, GoodixDefaultCallback callback,
 }
 
 void
-goodix_send_preset_psk_write (FpDevice *dev, guint32 flags, guint8 *psk,
-                              guint16 length, GDestroyNotify free_func,
-                              GoodixSuccessCallback callback,
-                              gpointer user_data)
-{
-  // Only support one flags, one payload and one length
-
-  guint8 *payload = g_malloc (sizeof (GoodixPresetPsk) + length);
-  GoodixPresetPsk *preset_psk = (GoodixPresetPsk *) payload;
-  GoodixCallbackInfo *cb_info;
-
-  preset_psk->flags = GUINT32_TO_LE (flags);
-  preset_psk->length = GUINT32_TO_LE (length);
-  memcpy (payload + sizeof (GoodixPresetPsk), psk, length);
-  if (free_func)
-    free_func (psk);
-
-  if (callback)
-    {
-      cb_info = malloc (sizeof (GoodixCallbackInfo));
-
-      cb_info->callback = G_CALLBACK (callback);
-      cb_info->user_data = user_data;
-
-      goodix_send_protocol (dev, GOODIX_CMD_PRESET_PSK_WRITE, payload,
-                            sizeof (payload) + length, g_free, TRUE, GOODIX_TIMEOUT,
-                            TRUE, goodix_receive_preset_psk_write, cb_info);
-      return;
-    }
-
-  goodix_send_protocol (dev, GOODIX_CMD_PRESET_PSK_WRITE, payload,
-                        sizeof (payload) + length, g_free, TRUE, GOODIX_TIMEOUT,
-                        TRUE, NULL, NULL);
-}
-
-void
 goodix_send_preset_psk_read (FpDevice *dev, guint32 flags, guint16 length,
                              GoodixPresetPskReadCallback callback,
                              gpointer user_data)
@@ -1184,6 +1143,22 @@ goodix_reset_state (FpDevice *dev)
   priv->reply = FALSE;
   priv->callback = NULL;
   priv->user_data = NULL;
+}
+
+// Abort an in-flight USB transfer (e.g. a read blocked waiting for a finger). All transfers
+// are submitted against priv->transfer_cancel_tkn, so cancelling it makes the pending read
+// fail with G_IO_ERROR_CANCELLED, which propagates up the active SSM. The token is reset
+// before the next read is armed (see goodix_receive_data_cb / goodix_start_read_loop), so
+// it self-recovers.
+void
+goodix_cancel (FpDevice *dev)
+{
+  FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (dev);
+  FpiDeviceGoodixTlsPrivate *priv =
+    fpi_device_goodixtls_get_instance_private (self);
+
+  if (priv->transfer_cancel_tkn)
+    g_cancellable_cancel (priv->transfer_cancel_tkn);
 }
 
 gboolean

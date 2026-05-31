@@ -42,15 +42,39 @@
 static GError *
 err_from_ssl (void)
 {
-  GError *err = malloc (sizeof (GError));
   unsigned long code = ERR_get_error ();
-
-  err->code = code;
   const char *msg = ERR_reason_error_string (code);
 
-  err->message = malloc (strlen (msg));
-  strcpy (err->message, msg);
-  return err;
+  if (!msg)
+    msg = "unknown SSL error";
+  // Build via glib so the struct (incl. ->domain) is fully initialised and freed by the
+  // matching allocator. The old hand-rolled malloc'd GError never set ->domain, so
+  // g_error_matches() read uninitialised memory and g_error_free() mismatched the allocator.
+  // The original SSL code is kept in the message for diagnostics.
+  return g_error_new (FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                      "SSL error (0x%lx): %s", code, msg);
+}
+
+// TLS session PSK used by the server callback. Defaults to 32 zero bytes, which is
+// what the 511-family chips use out of the box. Drivers whose chip carries a
+// non-zero, device-specific session PSK (e.g. the 5F10) call goodix_tls_set_psk()
+// before bringing TLS up.
+// NOTE: module-global, not per-device. Assumes a single Goodix TLS reader is active
+// at a time, which holds for these drivers. Two such readers with different session
+// PSKs would clash; make this per-instance before supporting that.
+static unsigned char goodix_tls_psk[64] = {0};
+static unsigned int  goodix_tls_psk_len = 32;
+
+void
+goodix_tls_set_psk (const guint8 *psk, unsigned int len)
+{
+  if (len > sizeof (goodix_tls_psk))
+    {
+      g_warning ("goodix: PSK of %u bytes truncated to %zu", len, sizeof (goodix_tls_psk));
+      len = sizeof (goodix_tls_psk);
+    }
+  memcpy (goodix_tls_psk, psk, len);
+  goodix_tls_psk_len = len;
 }
 
 static unsigned int
@@ -59,7 +83,7 @@ tls_server_psk_server_callback (SSL           *ssl,
                                 unsigned char *psk,
                                 unsigned int   max_psk_len)
 {
-  const int len = 32;
+  const unsigned int len = goodix_tls_psk_len;
 
   fp_dbg ("PSK WANTED %d", max_psk_len);
   if (len > max_psk_len)
@@ -68,9 +92,7 @@ tls_server_psk_server_callback (SSL           *ssl,
       return 0;
     }
 
-  // zero out the psk
-  for (int n = 0; n != len; ++n)
-    psk[n] = 0;
+  memcpy (psk, goodix_tls_psk, len);
 
   return len;
 }
