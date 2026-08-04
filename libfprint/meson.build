@@ -134,6 +134,10 @@ driver_sources = {
         'drivers/goodixmoc/goodix.c',
         'drivers/goodixmoc/goodix_proto.c',
     ),
+    'goodixtls5f10' : files(
+        'drivers/goodixtls/goodix5f10.c',
+        'drivers/goodixtls/sigfm.c',
+    ),
     'fpcmoc' : files('drivers/fpcmoc/fpc.c'),
     'realtek' : files('drivers/realtek/realtek.c'),
     'focaltech_moc' : files('drivers/focaltech_moc/focaltech_moc.c'),
@@ -145,6 +149,11 @@ helper_sources = {
     'aeslib': files('drivers/aeslib.c'),
     'aesx660': files('drivers/aesx660.c'),
     'aes3k': files('drivers/aes3k.c'),
+    'goodixtls': files(
+        'drivers/goodixtls/goodix_proto.c',
+        'drivers/goodixtls/goodix.c',
+        'drivers/goodixtls/goodixtls.c',
+    ),
     'openssl': files(),
     'pixman': files(),
     'udev': files(),
