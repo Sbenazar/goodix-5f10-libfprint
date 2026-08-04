@@ -1,0 +1,26 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build libglib2.0-dev libgusb-dev libssl-dev systemd-dev
+
+      - name: Build
+        run: |
+          meson setup build -Ddrivers=goodixtls5f10 -Ddoc=false -Dgtk-examples=false -Dintrospection=false
+          ninja -C build
+
+      - name: Check the driver got registered
+        run: ./build/libfprint/fprint-list-supported-devices | grep 27c6:5f10
