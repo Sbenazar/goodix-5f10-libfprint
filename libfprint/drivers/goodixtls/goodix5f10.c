@@ -111,6 +111,23 @@
  * apparent improvement. */
 #define GOODIX5F10_SIGFM_MAX_KP      192
 
+// ---- FDT (finger detection) ------------------------------------------------------------
+// The chip runs GOODIX5F10_FDT_CHANNELS capacitive detection channels. Every FDT command
+// answers with [irq u16][touch flag u16][one u16 reading per channel], and takes a
+// threshold table in the same channel order.
+#define GOODIX5F10_FDT_CHANNELS    10
+#define GOODIX5F10_FDT_REPLY_LEN   (4 + 2 * GOODIX5F10_FDT_CHANNELS)
+#define GOODIX5F10_FDT_PAYLOAD_LEN 34  // 2 header bytes, 10 threshold pairs, tail padding
+#define GOODIX5F10_FDT_THRESH_OFF  2
+// Offset added over the idle level when building a threshold, in the chip's half-scale
+// units. This is not the detection margin - the chip decides for itself, and it takes
+// roughly 25 below the threshold to fire: the deepest reading it left unflagged here was
+// 20 under, the shallowest it flagged was 28 under. Idle drift of a few units sits well
+// inside that, which is why the table can be rebuilt from any resting reading without the
+// wobble mattering. 2 is what the vendor stack used, and it reproduces fdt_reference_
+// thresholds below exactly.
+#define GOODIX5F10_FDT_DELTA       2
+
 typedef guint16 Goodix5f10Pix;
 
 struct _FpiDeviceGoodixTls5f10
@@ -139,6 +156,11 @@ struct _FpiDeviceGoodixTls5f10
   gboolean   otp_dac_valid;
   gboolean   otp_tcode_valid;
 
+  // FDT threshold table sent with every FDT command, in wire form. Seeded from the
+  // reference table and replaced by one measured on this sensor; see update_fdt_base.
+  guint8     fdt_base[GOODIX5F10_FDT_PAYLOAD_LEN];
+  gboolean   fdt_base_live;       // TRUE once the table came from a live reading
+
   // Per-device TLS session key loaded from disk at activation.
   guint8     tls_psk[GOODIX_5F10_PSK_LEN];
 };
@@ -148,12 +170,18 @@ G_DECLARE_FINAL_TYPE (FpiDeviceGoodixTls5f10, fpi_device_goodixtls5f10, FPI,
 G_DEFINE_TYPE (FpiDeviceGoodixTls5f10, fpi_device_goodixtls5f10,
                FPI_TYPE_DEVICE_GOODIXTLS);
 
-// FDT mode payload for 5F10 -- captured from the chip's own FDT_MODE init sequence.
-static const guint8 fdt_switch_state_mode[] = {
+// FDT threshold table captured on the development unit, kept only as the seed for the
+// first FDT command of a session. Every pair is that sensor's idle reading halved plus
+// GOODIX5F10_FDT_DELTA, duplicated across both bytes -- the packing the published 53x5
+// notes write as (v & 0xfffe) * 0x80 | v >> 1. Idle levels differ from sensor to sensor,
+// so this table describes one laptop and nothing else; update_fdt_base measures the real
+// one on first use.
+static const guint8 fdt_reference_thresholds[] = {
   0x09, 0x01, 0xaf, 0xaf, 0xb1, 0xb1, 0xaf, 0xaf, 0xb3, 0xb3, 0xae, 0xae,
   0xad, 0xad, 0xb4, 0xb4, 0xae, 0xae, 0xb1, 0xb1, 0xb3, 0xb3, 0x00, 0x00,
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
+G_STATIC_ASSERT (sizeof (fdt_reference_thresholds) == GOODIX5F10_FDT_PAYLOAD_LEN);
 
 // ---- frame decode / processing (copied from the goodix5xx base; small + self-contained)
 
@@ -245,6 +273,105 @@ static void
 check_none_cmd (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
 {
   if (err) { fpi_ssm_mark_failed (ssm, err); return; }
+  fpi_ssm_next_state (ssm);
+}
+
+// ---- FDT (finger detection) thresholds -------------------------------------------------
+
+static void
+dump_fdt_reply (const char *tag, guint8 *data, guint16 len)
+{
+  g_autofree gchar *hex = data_to_str (data, len);
+  g_autoptr (GString) chans = g_string_new (NULL);
+
+  fp_dbg ("FDT %s reply: %u bytes: %s", tag, len, hex);
+  if (len != GOODIX5F10_FDT_REPLY_LEN)
+    return;
+
+  for (guint i = 0; i < GOODIX5F10_FDT_CHANNELS; i++)
+    g_string_append_printf (chans, " %u",
+                            (guint) (data[4 + 2 * i] | (data[5 + 2 * i] << 8)));
+  fp_dbg ("FDT %s: irq 0x%04x, touch flag 0x%04x, channels:%s", tag,
+          (guint) (data[0] | (data[1] << 8)), (guint) (data[2] | (data[3] << 8)),
+          chans->str);
+}
+
+// Rebuild the FDT threshold table from a live idle reading.
+//
+// The table is per-unit: each channel's threshold is that sensor's resting level halved,
+// plus a small margin. Two sensors of the same model rest at different levels, so a table
+// captured on one of them puts another one's resting state on the wrong side of the
+// comparison -- FDT-down then returns without a finger and the driver captures air
+// (github issue #2). Measure it on the device in front of us instead.
+static void
+update_fdt_base (FpiDeviceGoodixTls5f10 *self, const char *tag,
+                 guint8 *data, guint16 len)
+{
+  const gboolean bootstrap = !self->fdt_base_live;
+  guint16 touch_flag;
+
+  if (len != GOODIX5F10_FDT_REPLY_LEN)
+    {
+      fp_warn ("FDT %s: reply is %u bytes, expected %u; keeping the current thresholds",
+               tag, len, (guint) GOODIX5F10_FDT_REPLY_LEN);
+      return;
+    }
+
+  // A reading taken with a finger on the sensor is not a resting level. The first reading
+  // of a session is taken regardless: until it lands, the thresholds belong to whichever
+  // unit the reference table was captured on, and anything measured here beats that.
+  touch_flag = data[2] | ((guint16) data[3] << 8);
+  if (touch_flag != 0 && !bootstrap)
+    return;
+
+  for (guint i = 0; i < GOODIX5F10_FDT_CHANNELS; i++)
+    {
+      const guint16 reading = data[4 + 2 * i] | ((guint16) data[5 + 2 * i] << 8);
+      const guint8 thresh = MIN ((reading >> 1) + GOODIX5F10_FDT_DELTA, 0xff);
+
+      self->fdt_base[GOODIX5F10_FDT_THRESH_OFF + 2 * i] = thresh;
+      self->fdt_base[GOODIX5F10_FDT_THRESH_OFF + 2 * i + 1] = thresh;
+    }
+  self->fdt_base_live = TRUE;
+
+  if (bootstrap)
+    {
+      g_autofree gchar *hex =
+        data_to_str (self->fdt_base + GOODIX5F10_FDT_THRESH_OFF,
+                     2 * GOODIX5F10_FDT_CHANNELS);
+
+      if (touch_flag != 0)
+        fp_warn ("FDT %s: first reading came with touch flag 0x%04x; the thresholds it "
+                 "yields may be off until the next capture", tag, touch_flag);
+      fp_dbg ("FDT thresholds measured on this sensor (from %s): %s", tag, hex);
+    }
+}
+
+// FDT-mode and FDT-up only answer once the sensor is clear, so their readings are resting
+// levels; FDT-down answers with a finger on it.
+static void
+check_fdt_mode_cmd (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
+{
+  if (err) { fpi_ssm_mark_failed (ssm, err); return; }
+  dump_fdt_reply ("mode", data, len);
+  update_fdt_base (FPI_DEVICE_GOODIXTLS5F10 (dev), "mode", data, len);
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+check_fdt_down_cmd (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
+{
+  if (err) { fpi_ssm_mark_failed (ssm, err); return; }
+  dump_fdt_reply ("down", data, len);
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+check_fdt_up_cmd (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
+{
+  if (err) { fpi_ssm_mark_failed (ssm, err); return; }
+  dump_fdt_reply ("up", data, len);
+  update_fdt_base (FPI_DEVICE_GOODIXTLS5F10 (dev), "up", data, len);
   fpi_ssm_next_state (ssm);
 }
 
@@ -579,14 +706,14 @@ on_capture_img (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *
 static void
 capture_run_state (FpiSsm *ssm, FpDevice *dev)
 {
-  const guint8 *fdt = fdt_switch_state_mode;
-  const guint16 fdt_len = sizeof (fdt_switch_state_mode);
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+  const guint8 *fdt = self->fdt_base;
+  const guint16 fdt_len = sizeof (self->fdt_base);
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case CAP_QUERY_MCU:
       {
-        FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
         g_clear_pointer (&self->capture_frames, g_ptr_array_unref);
         self->capture_frames = g_ptr_array_new_with_free_func (g_free);
         if (self->frames_target == 0)
@@ -596,10 +723,10 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       goodix_send_query_mcu_state (dev, check_none_cmd, ssm);
       break;
     case CAP_FDT_MODE:
-      goodix_send_mcu_switch_to_fdt_mode (dev, fdt, fdt_len, NULL, check_none_cmd, ssm);
+      goodix_send_mcu_switch_to_fdt_mode (dev, fdt, fdt_len, NULL, check_fdt_mode_cmd, ssm);
       break;
     case CAP_CAL_FDT_UP:
-      goodix_send_mcu_switch_to_fdt_up (dev, fdt, fdt_len, NULL, check_none_cmd, ssm);
+      goodix_send_mcu_switch_to_fdt_up (dev, fdt, fdt_len, NULL, check_fdt_up_cmd, ssm);
       break;
     case CAP_CAL_NAV0:
       goodix_send_nav_0 (dev, check_none_cmd, ssm);
@@ -608,14 +735,13 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       goodix_tls_read_image (dev, on_baseline_img, ssm);
       break;
     case CAP_FDT_DOWN:
-      goodix_send_mcu_switch_to_fdt_down (dev, fdt, fdt_len, NULL, check_none_cmd, ssm);
+      goodix_send_mcu_switch_to_fdt_down (dev, fdt, fdt_len, NULL, check_fdt_down_cmd, ssm);
       break;
     case CAP_GET_IMG:
       goodix_tls_read_image (dev, on_capture_img, ssm);
       break;
     case CAP_GET_IMG_REPEAT:
       {
-        FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
         // Grab more frames from the same press until we hit the target. GET_IMAGE rescans
         // the sensor each call, so normally no FDT re-arm is needed (and re-arming FDT_DOWN on
         // a held finger would block waiting for a down-edge that already happened). If the chip
@@ -630,7 +756,7 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       goodix_send_nav_0 (dev, after_rearm, ssm);
       break;
     case CAP_FDT_UP:
-      goodix_send_mcu_switch_to_fdt_up (dev, fdt, fdt_len, NULL, check_none_cmd, ssm);
+      goodix_send_mcu_switch_to_fdt_up (dev, fdt, fdt_len, NULL, check_fdt_up_cmd, ssm);
       break;
     }
 }
@@ -1059,6 +1185,9 @@ dev_cancel (FpDevice *dev)
 static void
 fpi_device_goodixtls5f10_init (FpiDeviceGoodixTls5f10 *self)
 {
+  // Seed with the development unit's table so the first FDT command has something to
+  // send; update_fdt_base replaces it with this sensor's own on the first reply.
+  memcpy (self->fdt_base, fdt_reference_thresholds, sizeof (self->fdt_base));
 }
 
 static void
