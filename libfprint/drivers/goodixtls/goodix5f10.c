@@ -128,6 +128,14 @@
 // thresholds below exactly.
 #define GOODIX5F10_FDT_DELTA       2
 
+// A baseline that comes back empty makes the subtraction below a no-op, and the touch ends
+// up preprocessed unlike every other one. Healthy frames here sit at 2420 of the 12-bit
+// range; the 550c driver saw dead ones averaging 0 to 10 (see the commit for their
+// write-up). 256 rejects those without judging exposure.
+#define GOODIX5F10_BASELINE_MIN_MEAN 256
+#define GOODIX5F10_BASELINE_RETRIES  8
+#define GOODIX5F10_BASELINE_RETRY_MS 120
+
 typedef guint16 Goodix5f10Pix;
 
 struct _FpiDeviceGoodixTls5f10
@@ -140,6 +148,7 @@ struct _FpiDeviceGoodixTls5f10
   GPtrArray     *capture_frames;  // 8-bit frames (guint8*, WIDTH*HEIGHT) from the current press
   guint          frames_target;   // how many frames to grab per press (enroll vs verify)
   gboolean       rearm_between;    // GOODIX5F10_REARM: send NAV0 between burst frames (fallback)
+  guint          baseline_retries; // consecutive no-signal baseline frames this press
 
   GPtrArray *enroll_images;       // array of guint8* (8-bit frames) kept in the gallery
 
@@ -643,6 +652,10 @@ static void
 on_baseline_img (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
 {
   FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+  g_autofree Goodix5f10Pix *frame = NULL;
+  Goodix5f10Pix min = 0xffff, max = 0;
+  guint64 total = 0;
+  double mean;
 
   if (err) { fpi_ssm_mark_failed (ssm, err); return; }
   if (len != GOODIX5F10_RAW_FRAME_SIZE)
@@ -652,9 +665,39 @@ on_baseline_img (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError 
                                              len, (guint) GOODIX5F10_RAW_FRAME_SIZE));
       return;
     }
-  if (!self->calibration_img)
-    self->calibration_img = g_malloc0 (GOODIX5F10_PIXELS * sizeof (Goodix5f10Pix));
-  decode_frame (self->calibration_img, len, data);
+
+  frame = g_malloc0 (GOODIX5F10_PIXELS * sizeof (Goodix5f10Pix));
+  decode_frame (frame, len, data);
+
+  for (guint i = 0; i < GOODIX5F10_PIXELS; i++)
+    {
+      const Goodix5f10Pix px = frame[i];
+
+      total += px;
+      if (px < min) min = px;
+      if (px > max) max = px;
+    }
+  mean = (double) total / GOODIX5F10_PIXELS;
+  fp_dbg ("baseline frame: mean %.1f, min %u, max %u", mean, (guint) min, (guint) max);
+
+  if (mean < GOODIX5F10_BASELINE_MIN_MEAN)
+    {
+      if (self->baseline_retries < GOODIX5F10_BASELINE_RETRIES)
+        {
+          self->baseline_retries++;
+          fp_dbg ("baseline frame carries no signal (mean %.1f); retrying (%u/%u)",
+                  mean, self->baseline_retries, (guint) GOODIX5F10_BASELINE_RETRIES);
+          fpi_ssm_jump_to_state_delayed (ssm, CAP_CAL_NAV0, GOODIX5F10_BASELINE_RETRY_MS);
+          return;
+        }
+      fpi_ssm_mark_failed (ssm, g_error_new (FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
+                                             "baseline frame carried no signal after %u attempts",
+                                             (guint) GOODIX5F10_BASELINE_RETRIES));
+      return;
+    }
+
+  g_free (self->calibration_img);
+  self->calibration_img = g_steal_pointer (&frame);
   fpi_ssm_next_state (ssm);
 }
 
@@ -720,6 +763,7 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       {
         g_clear_pointer (&self->capture_frames, g_ptr_array_unref);
         self->capture_frames = g_ptr_array_new_with_free_func (g_free);
+        self->baseline_retries = 0;
         if (self->frames_target == 0)
           self->frames_target = 1;
         self->rearm_between = (g_getenv ("GOODIX5F10_REARM") != NULL);
