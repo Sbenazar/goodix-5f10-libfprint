@@ -61,6 +61,29 @@ ninja -C build
 
 `./build/libfprint/fprint-list-supported-devices` should then list `27c6:5f10`.
 
+## Install
+
+Building is not enough. fprintd loads libfprint from the system library path, so
+the build has to end up there, and `meson setup` needs to be told where that is -
+the default prefix puts it in `/usr/local/lib64`, which is not in `ld.so.conf` on
+Fedora, and nothing ever picks it up (thanks @nexplorer-3e for that one):
+
+```sh
+meson setup build -Dprefix=/usr -Dlibdir=/usr/lib64 -Ddoc=false -Dgtk-examples=false
+ninja -C build && sudo ninja -C build install
+```
+
+There's deliberately no `-Ddrivers=goodixtls5f10` in that line. It's fine while
+you're testing out of the build tree, but a libfprint built with it contains this
+driver and nothing else, so installing that leaves your system unable to talk to
+any other fingerprint sensor.
+
+One more trap, since I walked into it myself: do not park a backup copy next to
+the installed library. `libfprint-2.so.2.0.0.bak` carries the same SONAME as the
+real one, and `ldconfig` is free to point `libfprint-2.so.2` at the backup - after
+which you're running the old build and wondering why your changes do nothing.
+Keep backups outside the library path.
+
 ## Enroll & verify
 
 ```sh
@@ -68,6 +91,15 @@ ninja -C build
 sudo systemctl restart fprintd
 fprintd-enroll
 fprintd-verify
+```
+
+Under SELinux fprintd also has to be allowed to read the PSK, or activation fails
+with a permission error:
+
+```sh
+sudo chown root:root /var/lib/fprint/goodix-5f10/psk
+sudo chcon -t fprintd_var_lib_t /var/lib/fprint/goodix-5f10/psk
+sudo systemctl restart fprintd
 ```
 
 ## Testing
