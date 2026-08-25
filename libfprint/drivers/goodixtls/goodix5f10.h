@@ -22,7 +22,11 @@
 #define GOODIX_5F10_EP_IN (0x1 | FPI_USB_ENDPOINT_IN)
 #define GOODIX_5F10_EP_OUT (0x1 | FPI_USB_ENDPOINT_OUT)
 
+// The firmware this driver was developed against, and the family it belongs to. Only
+// the family is enforced: 12704 is in the field and speaks the same protocol, and
+// refusing it just sends people editing this line (github issue #2).
 #define GOODIX_5F10_FIRMWARE_VERSION ("GF_ST411SEC_APP_12705")
+#define GOODIX_5F10_FIRMWARE_PREFIX  ("GF_ST411SEC_APP_")
 
 #define GOODIX_5F10_PSK_FLAGS (0xbb020003)
 

@@ -380,12 +380,16 @@ check_firmware (FpDevice *dev, gchar *firmware, gpointer ssm, GError *error)
 {
   if (error) { fpi_ssm_mark_failed (ssm, error); return; }
   fp_dbg ("Device firmware: \"%s\"", firmware);
-  if (strcmp (firmware, GOODIX_5F10_FIRMWARE_VERSION))
+  if (!g_str_has_prefix (firmware, GOODIX_5F10_FIRMWARE_PREFIX))
     {
       fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
                                              "Invalid device firmware: \"%s\"", firmware));
       return;
     }
+  if (strcmp (firmware, GOODIX_5F10_FIRMWARE_VERSION) != 0)
+    fp_warn ("Device firmware \"%s\" is not the \"%s\" this driver was developed against; "
+             "same family, but report anything that misbehaves",
+             firmware, GOODIX_5F10_FIRMWARE_VERSION);
   fpi_ssm_next_state (ssm);
 }
 
