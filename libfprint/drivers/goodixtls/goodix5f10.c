@@ -160,6 +160,7 @@ struct _FpiDeviceGoodixTls5f10
 
   // per-device factory calibration parsed from OTP (0xa6). Each calibration field
   // is stored with triple redundancy (value, complement, duplicate); see parse_otp.
+  guint8     config[sizeof (goodix_5f10_config)]; // config as sent, DAC rewritten per device
   guint8     otp_dac_h;           // factory DAC_H (OTP[0x1F]); 0 if redundancy failed
   guint8     otp_tcode;           // factory TCODE (OTP[0x16]); 0 if redundancy failed
   gboolean   otp_dac_valid;
@@ -551,9 +552,56 @@ parse_otp (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm, GError *er
   fpi_ssm_next_state (ssm);
 }
 
+// ---- MCU config ------------------------------------------------------------------------
+// The config template is a dump taken from the development unit, and one of its entries is
+// that unit's factory DAC: tag 0x0220 carries (OTP DAC << 4) | 8. Uploading it verbatim
+// runs every other sensor at this laptop's operating point, so the entry is rewritten from
+// the OTP of the device in hand. Layout: a leading byte, eight (base, size) section pairs,
+// then 4-byte entries of u16 tag and u16 value, and the table's own checksum in the tail.
+#define GOODIX5F10_CONFIG_SECTIONS 8
+#define GOODIX5F10_CONFIG_DAC_TAG  0x0220
+
+static void
+config_set_checksum (guint8 *config, gsize len)
+{
+  guint32 checksum = 0xa5a5;
+
+  for (gsize i = 0; i + 2 < len; i += 2)
+    checksum = (checksum + (config[i] | ((guint16) config[i + 1] << 8))) & 0xffff;
+  checksum = 0x10000 - checksum;
+  config[len - 2] = checksum & 0xff;
+  config[len - 1] = (checksum >> 8) & 0xff;
+}
+
+static void
+config_set_dac (guint8 *config, gsize len, guint8 dac)
+{
+  const guint16 value = ((guint16) dac << 4) | 8;
+
+  for (guint section = 0; section < GOODIX5F10_CONFIG_SECTIONS; section++)
+    {
+      const guint base = config[1 + 2 * section];
+      const guint end = MIN (base + config[2 + 2 * section], len);
+
+      for (guint entry = base; entry + 4 <= end; entry += 4)
+        {
+          if ((config[entry] | ((guint16) config[entry + 1] << 8)) != GOODIX5F10_CONFIG_DAC_TAG)
+            continue;
+          fp_dbg ("config DAC 0x%04x -> 0x%04x (OTP 0x%02x)",
+                  (guint) (config[entry + 2] | ((guint16) config[entry + 3] << 8)),
+                  (guint) value, dac);
+          config[entry + 2] = value & 0xff;
+          config[entry + 3] = value >> 8;
+        }
+    }
+  config_set_checksum (config, len);
+}
+
 static void
 activate_run_state (FpiSsm *ssm, FpDevice *dev)
 {
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case ACTIVATE_READ_AND_NOP:
@@ -588,8 +636,12 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
       goodix_send_mcu_switch_to_idle_mode (dev, 20, check_none, ssm);
       break;
     case ACTIVATE_UPLOAD_MCU_CONFIG:
-      goodix_send_upload_config_mcu (dev, goodix_5f10_config,
-                                     sizeof (goodix_5f10_config), NULL,
+      memcpy (self->config, goodix_5f10_config, sizeof (self->config));
+      // GOODIX5F10_NO_DAC_PATCH uploads the template untouched, so a tester can compare
+      // both operating points with one build.
+      if (self->otp_dac_valid && g_getenv ("GOODIX5F10_NO_DAC_PATCH") == NULL)
+        config_set_dac (self->config, sizeof (self->config), self->otp_dac_h);
+      goodix_send_upload_config_mcu (dev, self->config, sizeof (self->config), NULL,
                                      check_success, ssm);
       break;
     case ACTIVATE_SET_POWERDOWN_SCAN_FREQUENCY:
