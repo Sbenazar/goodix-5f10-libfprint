@@ -52,6 +52,12 @@ You need meson, ninja, glib, gusb, udev and OpenSSL headers (on Ubuntu that is
 `meson ninja-build libglib2.0-dev libgusb-dev libssl-dev systemd-dev`). Built here with
 meson 1.11 and gcc 16; CI runs the same two commands on Ubuntu on every push.
 
+That list is enough for the driver-only build below. A full build, which is what
+you want for Install, also pulls in the other drivers and needs
+`libpixman-1-dev libcairo2-dev libgudev-1.0-dev` on top - without them `meson
+setup` stops at "pixman is required for aes3500" or "udev is required for SPI
+support" (thanks @dimaCaptain).
+
 ```sh
 git clone https://github.com/Sbenazar/goodix-5f10-libfprint
 cd goodix-5f10-libfprint
@@ -69,9 +75,17 @@ the default prefix puts it in `/usr/local/lib64`, which is not in `ld.so.conf` o
 Fedora, and nothing ever picks it up (thanks @nexplorer-3e for that one):
 
 ```sh
+# Fedora and other lib64 distros
 meson setup build -Dprefix=/usr -Dlibdir=/usr/lib64 -Ddoc=false -Dgtk-examples=false
+# Debian and Ubuntu
+meson setup build -Dprefix=/usr -Dlibdir=/usr/lib/x86_64-linux-gnu -Ddoc=false -Dgtk-examples=false
+
 ninja -C build && sudo ninja -C build install
 ```
+
+If you're unsure which one you're on, `ldconfig -p | grep libfprint-2.so.2` prints
+the path the loader actually uses, and that's the directory your build has to land
+in.
 
 There's deliberately no `-Ddrivers=goodixtls5f10` in that line. It's fine while
 you're testing out of the build tree, but a libfprint built with it contains this
@@ -101,6 +115,15 @@ sudo chown root:root /var/lib/fprint/goodix-5f10/psk
 sudo chcon -t fprintd_var_lib_t /var/lib/fprint/goodix-5f10/psk
 sudo systemctl restart fprintd
 ```
+
+One thing to know before you reach for `examples/verify` instead: it asks which
+finger to verify *after* opening the device, and it reads that answer straight
+from stdin inside a main loop callback. While the loop sits there, glib doesn't
+refresh the time it hands out to timeouts, so the next command the driver sends
+gets a deadline that already expired and fails on the spot with
+`Command timed out: 0xae`. It looks like the sensor went stale during the pause;
+it didn't, and the same pause with the loop left running is fine. fprintd never
+blocks its loop, so nothing you do through fprintd runs into this.
 
 ## Testing
 
