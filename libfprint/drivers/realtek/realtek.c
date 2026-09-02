@@ -516,7 +516,7 @@ fp_check_duplicate_cb (FpiDeviceRealtek *self,
   if (in_status == FP_RTK_SUCCESS)
     {
       fpi_ssm_mark_failed (self->task_ssm,
-                           fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                           fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_DUPLICATE,
                                                      "Current fingerprint is duplicate!"));
     }
   else if (in_status == FP_RTK_MATCH_FAIL)
@@ -909,9 +909,6 @@ fp_verify_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   fp_info ("Verify complete!");
 
-  if (fpi_ssm_get_error (ssm))
-    error = fpi_ssm_get_error (ssm);
-
   if (error && error->domain == FP_DEVICE_RETRY)
     {
       if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY)
@@ -936,9 +933,6 @@ fp_enroll_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   fp_info ("Enrollment complete!");
 
-  if (fpi_ssm_get_error (ssm))
-    error = fpi_ssm_get_error (ssm);
-
   if (error)
     {
       fpi_device_enroll_complete (dev, NULL, error);
@@ -958,9 +952,6 @@ fp_init_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   fp_info ("Init complete!");
 
-  if (fpi_ssm_get_error (ssm))
-    error = fpi_ssm_get_error (ssm);
-
   fpi_device_open_complete (dev, error);
   self->task_ssm = NULL;
 }
@@ -971,9 +962,6 @@ fp_delete_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
   FpiDeviceRealtek *self = FPI_DEVICE_REALTEK (dev);
 
   fp_info ("Delete print complete!");
-
-  if (fpi_ssm_get_error (ssm))
-    error = fpi_ssm_get_error (ssm);
 
   fpi_device_delete_complete (dev, error);
   self->task_ssm = NULL;
