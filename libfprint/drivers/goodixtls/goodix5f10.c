@@ -136,6 +136,18 @@
 #define GOODIX5F10_BASELINE_RETRIES  8
 #define GOODIX5F10_BASELINE_RETRY_MS 120
 
+// Stamp carried as the first element of the stored gallery: four magic bytes, the version
+// of the frame pipeline, and the operating point the frames were taken at. A gallery is raw
+// frames, so both the pipeline and the operating point decide whether a stored print still
+// looks like what this sensor produces today. Bump the version whenever the pipeline changes.
+//
+// It rides inside the same "aay" as the frames rather than changing the type of fpi-data,
+// which means a driver built before this still reads the print: it takes every element of
+// the array whose length is a frame and skips the rest, so the stamp goes past it unnoticed.
+#define GOODIX5F10_PIPELINE_VERSION 1
+#define GOODIX5F10_STAMP_LEN 7
+G_STATIC_ASSERT (GOODIX5F10_STAMP_LEN != GOODIX5F10_PIXELS);
+
 typedef guint16 Goodix5f10Pix;
 
 struct _FpiDeviceGoodixTls5f10
@@ -1090,13 +1102,20 @@ enroll_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
   fpi_device_get_enroll_data (dev, &print);
   fpi_print_set_type (print, FPI_PRINT_RAW);
 
-  // Store the gallery as GVariant "aay": one fixed 8-bit frame per enrolled zone. We persist
-  // raw frames (not serialized SIFT descriptors) on purpose: the template
+  // Store the gallery as GVariant "aay": a stamp, then one fixed 8-bit frame per enrolled
+  // zone. We persist raw frames (not serialized SIFT descriptors) on purpose: the template
   // stays independent of the matcher, so a future sigfm/algorithm change still matches old
   // enrollments without re-enrolling. Trade-off (accepted): the print holds raw fingerprint
   // images, and verify re-extracts SIFT each time (cheap at 56x176).
   GVariantBuilder builder;
+  const guint8 stamp[GOODIX5F10_STAMP_LEN] = {
+    'G', 'X', '5', 'F', GOODIX5F10_PIPELINE_VERSION, self->sent_dac, self->sent_tcode
+  };
+
   g_variant_builder_init (&builder, G_VARIANT_TYPE ("aay"));
+  g_variant_builder_add (&builder, "@ay",
+                         g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, stamp,
+                                                    sizeof (stamp), 1));
   for (guint i = 0; i < self->enroll_images->len; i++)
     {
       guint8 *img = g_ptr_array_index (self->enroll_images, i);
@@ -1122,12 +1141,29 @@ enum verify_states {
   VERIFY_NUM_STATES,
 };
 
+// Compare a stored stamp against the point this sensor runs at now. Mismatch is not a
+// refusal: on the gallery sizes the driver enrolls, a shifted operating point still matched
+// in testing, so refusing here would break people the sensor would have let in. It goes in
+// the log so that a failure nobody can otherwise explain has a first thing to look at.
+static void
+check_stamp (FpiDeviceGoodixTls5f10 *self, const guint8 *stamp)
+{
+  if (stamp[4] != GOODIX5F10_PIPELINE_VERSION)
+    fp_warn ("print was enrolled by pipeline version %u, this driver is version %u; "
+             "matching it anyway, but re-enrolling is the fix if it stops being recognised",
+             stamp[4], (guint) GOODIX5F10_PIPELINE_VERSION);
+  else if (stamp[5] != self->sent_dac || stamp[6] != self->sent_tcode)
+    fp_warn ("print was enrolled at DAC 0x%02x TCODE 0x%02x, this sensor runs at "
+             "0x%02x 0x%02x; matching it anyway",
+             stamp[5], stamp[6], self->sent_dac, self->sent_tcode);
+}
+
 // Score a set of probe frames (all grabbed from one finger press) against one stored
 // template's gallery (a GVariant "aay"). Each gallery sample is extracted once and matched
 // against every probe frame; the sample's score is the best over probes. Returns the best
 // score across all samples and the count of samples scoring >= THRESHOLD.
 static int
-score_template_multi (SigfmImgInfo **probes, guint n_probes,
+score_template_multi (FpiDeviceGoodixTls5f10 *self, SigfmImgInfo **probes, guint n_probes,
                       GVariant *tmpl_data, int *out_match_count)
 {
   GVariantIter iter;
@@ -1139,7 +1175,9 @@ score_template_multi (SigfmImgInfo **probes, guint n_probes,
     {
       gsize len;
       const guint8 *img = g_variant_get_fixed_array (child, &len, 1);
-      if (len == GOODIX5F10_PIXELS)
+      if (len == GOODIX5F10_STAMP_LEN && memcmp (img, "GX5F", 4) == 0)
+        check_stamp (self, img);
+      else if (len == GOODIX5F10_PIXELS)
         {
           SigfmImgInfo *ti = sigfm_extract_ex (img, GOODIX5F10_WIDTH, GOODIX5F10_HEIGHT, GOODIX5F10_SIGFM_MAX_KP);
           int sample_best = 0;
@@ -1200,7 +1238,7 @@ verify_run_state (FpiSsm *ssm, FpDevice *dev)
                 g_object_get (G_OBJECT (tmpl), "fpi-data", &tdata, NULL);
                 if (!tdata) continue;
                 int mc = 0;
-                int best = score_template_multi (probes, n_probes, tdata, &mc);
+                int best = score_template_multi (self, probes, n_probes, tdata, &mc);
                 g_variant_unref (tdata);
                 if (best >= GOODIX5F10_SIGFM_BEST_MIN &&
                     mc >= GOODIX5F10_SIGFM_MIN_SAMPLES && best > best_score)
@@ -1222,7 +1260,7 @@ verify_run_state (FpiSsm *ssm, FpDevice *dev)
             g_object_get (G_OBJECT (print), "fpi-data", &data, NULL);
             if (data)
               {
-                best = score_template_multi (probes, n_probes, data, &mc);
+                best = score_template_multi (self, probes, n_probes, data, &mc);
                 g_variant_unref (data);
               }
             fp_dbg ("verify best sigfm %d, matching samples %d over %u probe frames "
