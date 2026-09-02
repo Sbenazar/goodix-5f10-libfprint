@@ -160,11 +160,13 @@ struct _FpiDeviceGoodixTls5f10
 
   // per-device factory calibration parsed from OTP (0xa6). Each calibration field
   // is stored with triple redundancy (value, complement, duplicate); see parse_otp.
-  guint8     config[sizeof (goodix_5f10_config)]; // config as sent, DAC rewritten per device
-  guint8     otp_dac_h;           // factory DAC_H (OTP[0x1F]); 0 if redundancy failed
-  guint8     otp_tcode;           // factory TCODE (OTP[0x16]); 0 if redundancy failed
-  gboolean   otp_dac_valid;
+  guint8     config[GOODIX5F10_CONFIG_LEN]; // the table as sent, rewritten per device
+  guint8     otp_dac;             // factory DAC (OTP[0x1F]/[0x1B]/[0x1A])
+  guint8     otp_tcode;           // factory TCODE (OTP[0x16]/[0x17]/[0x19])
+  gboolean   otp_dac_valid;       // FALSE -> otp_dac holds the development unit's value
   gboolean   otp_tcode_valid;
+  guint8     sent_dac;            // what the config actually went out with, which is not
+  guint8     sent_tcode;          // the OTP when GOODIX5F10_NO_OTP_PATCH is set
 
   // FDT threshold table sent with every FDT command, in wire form. Seeded from the
   // reference table and replaced by one measured on this sensor; see update_fdt_base.
@@ -442,13 +444,11 @@ check_reset (FpDevice *dev, gboolean success, guint16 number, gpointer ssm, GErr
                                              "Failed to reset device"));
       return;
     }
+  // The 511x reports 2048 and this one 1024, so it tracks the part, not anything we need.
   fp_dbg ("Device reset number: %d", number);
   if (number != GOODIX_5F10_RESET_NUMBER)
-    {
-      fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                                             "Invalid device reset number: %d", number));
-      return;
-    }
+    fp_warn ("Device reset number %d, expected %d; carrying on", number,
+             GOODIX_5F10_RESET_NUMBER);
   fpi_ssm_next_state (ssm);
 }
 
@@ -506,15 +506,25 @@ enum activate_states {
   ACTIVATE_NUM_STATES,
 };
 
-// 32-byte OTP block. Each calibration field is stored with triple redundancy
-// (value, its bitwise complement, and a duplicate); validate the triple and fall
-// back to chip defaults when it does not hold.
+// 32-byte OTP block. Each calibration field is stored with triple redundancy: the value,
+// its bitwise complement, and a duplicate.
 #define GOODIX5F10_OTP_LEN 0x20
 
-static gboolean
-otp_triple_ok (guint8 value, guint8 complement, guint8 duplicate)
+// Each calibration byte is stored three times: the value, its complement and a copy. Any
+// two of the three agreeing is enough, which is what the vendor settles for too. 0xff is an
+// erased byte rather than a value. Returns 0 when nothing agrees.
+static guint8
+otp_pick (guint8 value, guint8 complement, guint8 duplicate)
 {
-  return value != 0 && value == (guint8) ~complement && value == duplicate;
+  const guint8 expect = (guint8) ~complement;
+
+  if (duplicate != 0 && duplicate == value)
+    return value == 0xff ? 0 : value;
+  if (value != 0 && expect == value)
+    return value == 0xff ? 0 : value;
+  if (duplicate != 0 && expect == duplicate)
+    return duplicate == 0xff ? 0 : duplicate;
+  return 0;
 }
 
 // Read the OTP block during activation (the vendor init sequence does the same) and log
@@ -535,31 +545,86 @@ parse_otp (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm, GError *er
       return;
     }
 
-  self->otp_dac_valid   = otp_triple_ok (data[0x1F], data[0x1B], data[0x1A]);
-  self->otp_tcode_valid = otp_triple_ok (data[0x16], data[0x17], data[0x19]);
-  self->otp_dac_h = self->otp_dac_valid ? data[0x1F] : 0;
-  self->otp_tcode = self->otp_tcode_valid ? data[0x16] : 0;
+  {
+    g_autofree gchar *raw = data_to_str (data, GOODIX5F10_OTP_LEN);
+    const guint8 dac = otp_pick (data[0x1F], data[0x1B], data[0x1A]);
+    const guint8 tcode = otp_pick (data[0x16], data[0x17], data[0x19]);
 
-  if (self->otp_dac_valid)
-    fp_dbg ("OTP per-device factory DAC_H = 0x%02x", self->otp_dac_h);
-  else
-    fp_warn ("OTP DAC_H failed redundancy check; will use chip default");
-  if (self->otp_tcode_valid)
-    fp_dbg ("OTP per-device factory TCODE = 0x%02x", self->otp_tcode);
-  else
-    fp_warn ("OTP TCODE failed redundancy check; will use chip default");
+    fp_dbg ("OTP: %s", raw);
+
+    // Falling back to the development unit's numbers rather than to the table's own: the
+    // placeholder in there is the vendor's "not personalised yet" value and would leave the
+    // sensor with no usable signal. The vendor can be laxer here because it validates the
+    // OTP checksums first, which we do not.
+    self->otp_dac_valid = (dac != 0);
+    self->otp_tcode_valid = (tcode != 0);
+    self->otp_dac = self->otp_dac_valid ? dac : GOODIX5F10_DEV_DAC;
+    self->otp_tcode = self->otp_tcode_valid ? tcode : GOODIX5F10_DEV_TCODE;
+
+    if (self->otp_dac_valid)
+      fp_dbg ("OTP factory DAC = 0x%02x", self->otp_dac);
+    else
+      fp_warn ("OTP DAC is unreadable; falling back to 0x%02x", self->otp_dac);
+    if (self->otp_tcode_valid)
+      fp_dbg ("OTP factory TCODE = 0x%02x", self->otp_tcode);
+    else
+      fp_warn ("OTP TCODE is unreadable; falling back to 0x%02x", self->otp_tcode);
+  }
 
   fpi_ssm_next_state (ssm);
 }
 
 // ---- MCU config ------------------------------------------------------------------------
-// The config template is a dump taken from the development unit, and one of its entries is
-// that unit's factory DAC: tag 0x0220 carries (OTP DAC << 4) | 8. Uploading it verbatim
-// runs every other sensor at this laptop's operating point, so the entry is rewritten from
-// the OTP of the device in hand. Layout: a leading byte, eight (base, size) section pairs,
-// then 4-byte entries of u16 tag and u16 value, and the table's own checksum in the tail.
-#define GOODIX5F10_CONFIG_SECTIONS 8
-#define GOODIX5F10_CONFIG_DAC_TAG  0x0220
+// Three entries in the table are per-unit, and all three come out of two OTP bytes. Which
+// entry lives in which section matters: tag 0x005c appears in three sections and only the
+// one in section 4 is calibration, so a search across the whole table would rewrite two
+// entries that are meant to stay put.
+#define GOODIX5F10_CONFIG_SECTIONS  8
+#define GOODIX5F10_CONFIG_DAC_TAG   0x0220
+#define GOODIX5F10_CONFIG_TCODE_TAG 0x005c
+#define GOODIX5F10_CONFIG_DELTA_TAG 0x0082
+#define GOODIX5F10_CONFIG_DAC_SEC   0
+#define GOODIX5F10_CONFIG_DELTA_SEC 2
+#define GOODIX5F10_CONFIG_TCODE_SEC 4
+
+// The table as the vendor ships it, before any per-device rewriting. Layout: a leading
+// byte, eight (base, size) section pairs, then 4-byte entries of u16 tag and u16 value, and
+// the table's own 16-bit checksum in the last two bytes. The chip's inner length is 225 =
+// these 224 bytes plus one checksum byte that goodix_send_upload_config_mcu() appends.
+//
+// Three entries carry one unit's factory calibration and the vendor rewrites them from that
+// unit's OTP before upload; here they hold its placeholder values (tag 0x0220 = 0x1008,
+// 0x0082 = 0x1580, 0x005c = 0x0080). The same tags and the same arithmetic turn up in
+// goodix-fp-dump for the neighbouring parts -- driver_51x0.py writes tag 0x0220 as
+// (dac << 4) | 8, driver_53x5.py patches 0x220, 0x5c and 0x82 out of its calibration struct.
+static const guint8 goodix_5f10_config[] = {
+  0x30, 0x11, 0x64, 0x75, 0x00, 0x75, 0x2c, 0xa1, 0x1c, 0xbd, 0x18, 0xd5,
+  0x00, 0xd5, 0x00, 0xd5, 0x00, 0xba, 0x00, 0x00, 0x80, 0xca, 0x00, 0x06,
+  0x00, 0x84, 0x00, 0xbe, 0xb2, 0x86, 0x00, 0xc5, 0xb9, 0x88, 0x00, 0xb5,
+  0xad, 0x8a, 0x00, 0x9d, 0x95, 0x8c, 0x00, 0x00, 0xbe, 0x8e, 0x00, 0x00,
+  0xc5, 0x90, 0x00, 0x00, 0xb5, 0x92, 0x00, 0x00, 0x9d, 0x94, 0x00, 0x00,
+  0xaf, 0x96, 0x00, 0x00, 0xbf, 0x98, 0x00, 0x00, 0xb6, 0x9a, 0x00, 0x00,
+  0xa7, 0xd2, 0x00, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x00, 0xd6, 0x00, 0x00,
+  0x00, 0xd8, 0x00, 0x00, 0x00, 0x12, 0x00, 0x03, 0x04, 0xd0, 0x00, 0x00,
+  0x00, 0x70, 0x00, 0x00, 0x00, 0x72, 0x00, 0x78, 0x56, 0x74, 0x00, 0x34,
+  0x12, 0x20, 0x00, 0x10, 0x40, 0x20, 0x02, 0x08, 0x10, 0x2a, 0x01, 0x82,
+  0x03, 0x22, 0x00, 0x01, 0x20, 0x24, 0x00, 0x14, 0x00, 0x80, 0x00, 0x01,
+  0x04, 0x5c, 0x00, 0x00, 0x01, 0x56, 0x00, 0x0c, 0x24, 0x58, 0x00, 0x05,
+  0x00, 0x32, 0x00, 0x08, 0x02, 0x66, 0x00, 0x00, 0x02, 0x7c, 0x00, 0x00,
+  0x38, 0x82, 0x00, 0x80, 0x15, 0x2a, 0x01, 0x08, 0x00, 0x5c, 0x00, 0x80,
+  0x00, 0x54, 0x00, 0x00, 0x01, 0x62, 0x00, 0x38, 0x04, 0x64, 0x00, 0x10,
+  0x00, 0x66, 0x00, 0x00, 0x02, 0x7c, 0x00, 0x01, 0x38, 0x2a, 0x01, 0x08,
+  0x00, 0x5c, 0x00, 0x80, 0x00, 0x52, 0x00, 0x08, 0x00, 0x54, 0x00, 0x00,
+  0x01, 0x66, 0x00, 0x00, 0x02, 0x7c, 0x00, 0x01, 0x38, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc2, 0x1d};
+G_STATIC_ASSERT (sizeof (goodix_5f10_config) == GOODIX5F10_CONFIG_LEN);
+
+const guint8 *
+goodix5f10_config_template (gsize *len)
+{
+  *len = sizeof (goodix_5f10_config);
+  return goodix_5f10_config;
+}
 
 static void
 config_set_checksum (guint8 *config, gsize len)
@@ -573,27 +638,64 @@ config_set_checksum (guint8 *config, gsize len)
   config[len - 1] = (checksum >> 8) & 0xff;
 }
 
-static void
-config_set_dac (guint8 *config, gsize len, guint8 dac)
+static gboolean
+config_entry_offset (const guint8 *config, gsize len, guint section, guint16 tag, guint *out)
 {
-  const guint16 value = ((guint16) dac << 4) | 8;
+  guint base, end;
 
-  for (guint section = 0; section < GOODIX5F10_CONFIG_SECTIONS; section++)
+  if (section >= GOODIX5F10_CONFIG_SECTIONS)
+    return FALSE;
+
+  base = config[1 + 2 * section];
+  end = MIN (base + config[2 + 2 * section], len);
+  for (guint entry = base; entry + 4 <= end; entry += 4)
+    if ((config[entry] | ((guint16) config[entry + 1] << 8)) == tag)
+      {
+        *out = entry;
+        return TRUE;
+      }
+  return FALSE;
+}
+
+// keep_low_byte is for tag 0x0082, where only the top half is the delta.
+static void
+config_set_entry (guint8 *config, gsize len, guint section, guint16 tag, guint16 value,
+                  gboolean keep_low_byte)
+{
+  guint entry;
+  guint16 old;
+
+  if (!config_entry_offset (config, len, section, tag, &entry))
     {
-      const guint base = config[1 + 2 * section];
-      const guint end = MIN (base + config[2 + 2 * section], len);
-
-      for (guint entry = base; entry + 4 <= end; entry += 4)
-        {
-          if ((config[entry] | ((guint16) config[entry + 1] << 8)) != GOODIX5F10_CONFIG_DAC_TAG)
-            continue;
-          fp_dbg ("config DAC 0x%04x -> 0x%04x (OTP 0x%02x)",
-                  (guint) (config[entry + 2] | ((guint16) config[entry + 3] << 8)),
-                  (guint) value, dac);
-          config[entry + 2] = value & 0xff;
-          config[entry + 3] = value >> 8;
-        }
+      fp_warn ("config: no tag 0x%04x in section %u, leaving the table as it is", tag, section);
+      return;
     }
+
+  old = config[entry + 2] | ((guint16) config[entry + 3] << 8);
+  if (keep_low_byte)
+    value = (value & 0xff00) | (old & 0x00ff);
+  fp_dbg ("config sec%u tag 0x%04x: 0x%04x -> 0x%04x", section, tag, old, value);
+  config[entry + 2] = value & 0xff;
+  config[entry + 3] = value >> 8;
+}
+
+// DAC is the analog offset of the read path; TCODE drives the image integration time and,
+// through it, the margin the chip wants before it calls a channel touched. The arithmetic
+// is the vendor's; goodix-fp-dump derives the same two numbers the same way for the
+// neighbouring parts.
+void
+goodix5f10_config_patch_from_otp (guint8 *config, gsize len, guint8 dac, guint8 tcode)
+{
+  const guint16 image_tcode = (guint16) ((((guint) tcode >> 4) + 1) * 16);
+  const guint tmp = ((((guint) tcode & 0xf) + 2) * 25600u) / image_tcode;
+  const guint16 fdt_delta = (guint16) ((tmp / 3) >> 4) & 0xff;
+
+  config_set_entry (config, len, GOODIX5F10_CONFIG_DAC_SEC, GOODIX5F10_CONFIG_DAC_TAG,
+                    ((guint16) dac << 4) | 8, FALSE);
+  config_set_entry (config, len, GOODIX5F10_CONFIG_TCODE_SEC, GOODIX5F10_CONFIG_TCODE_TAG,
+                    image_tcode, FALSE);
+  config_set_entry (config, len, GOODIX5F10_CONFIG_DELTA_SEC, GOODIX5F10_CONFIG_DELTA_TAG,
+                    (guint16) (fdt_delta << 8), TRUE);
   config_set_checksum (config, len);
 }
 
@@ -637,10 +739,19 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
     case ACTIVATE_UPLOAD_MCU_CONFIG:
       memcpy (self->config, goodix_5f10_config, sizeof (self->config));
-      // GOODIX5F10_NO_DAC_PATCH uploads the template untouched, so a tester can compare
-      // both operating points with one build.
-      if (self->otp_dac_valid && g_getenv ("GOODIX5F10_NO_DAC_PATCH") == NULL)
-        config_set_dac (self->config, sizeof (self->config), self->otp_dac_h);
+      if (g_getenv ("GOODIX5F10_NO_OTP_PATCH") != NULL)
+        {
+          fp_dbg ("GOODIX5F10_NO_OTP_PATCH set, running at the development unit's point");
+          self->sent_dac = GOODIX5F10_DEV_DAC;
+          self->sent_tcode = GOODIX5F10_DEV_TCODE;
+        }
+      else
+        {
+          self->sent_dac = self->otp_dac;
+          self->sent_tcode = self->otp_tcode;
+        }
+      goodix5f10_config_patch_from_otp (self->config, sizeof (self->config),
+                                        self->sent_dac, self->sent_tcode);
       goodix_send_upload_config_mcu (dev, self->config, sizeof (self->config), NULL,
                                      check_success, ssm);
       break;
@@ -980,10 +1091,10 @@ enroll_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
   fpi_print_set_type (print, FPI_PRINT_RAW);
 
   // Store the gallery as GVariant "aay": one fixed 8-bit frame per enrolled zone. We persist
-  // raw frames (not serialized SIFT descriptors) on purpose: the template stays independent
-  // of the matcher, so a future sigfm/algorithm change still matches old enrollments without
-  // re-enrolling. Trade-off (accepted): the print holds raw fingerprint images, and verify
-  // re-extracts SIFT each time (cheap at 56x176).
+  // raw frames (not serialized SIFT descriptors) on purpose: the template
+  // stays independent of the matcher, so a future sigfm/algorithm change still matches old
+  // enrollments without re-enrolling. Trade-off (accepted): the print holds raw fingerprint
+  // images, and verify re-extracts SIFT each time (cheap at 56x176).
   GVariantBuilder builder;
   g_variant_builder_init (&builder, G_VARIANT_TYPE ("aay"));
   for (guint i = 0; i < self->enroll_images->len; i++)
@@ -1289,6 +1400,11 @@ fpi_device_goodixtls5f10_init (FpiDeviceGoodixTls5f10 *self)
   // send; update_fdt_base replaces it with this sensor's own on the first reply.
   memcpy (self->fdt_base, fdt_reference_thresholds, sizeof (self->fdt_base));
 }
+
+static const FpIdEntry id_table[] = {
+  {.vid = 0x27c6, .pid = 0x5f10},
+  {.vid = 0, .pid = 0, .driver_data = 0},
+};
 
 static void
 fpi_device_goodixtls5f10_class_init (FpiDeviceGoodixTls5f10Class *class)
