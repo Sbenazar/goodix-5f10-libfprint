@@ -322,7 +322,17 @@ if 'virtual_image' in drivers
     ]
 endif
 
-unit_tests_deps = { 'fpi-assembling' : [cairo_dep] }
+if 'goodixtls5f10' in drivers
+    unit_tests += ['goodix5f10-config']
+endif
+
+# The 5F10 config helpers live in the driver, which is linked into the shared library
+# behind the version script, so the test picks up the driver objects directly. Same trick
+# the hwdb generator uses.
+unit_tests_deps = {
+    'fpi-assembling' : [cairo_dep],
+    'goodix5f10-config' : [declare_dependency(link_with: libfprint_drivers)],
+}
 
 foreach test_name: unit_tests
     if unit_tests_deps.has_key(test_name)
