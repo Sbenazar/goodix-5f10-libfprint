@@ -7,10 +7,9 @@ on top, sitting on current
 [libfprint](https://gitlab.freedesktop.org/libfprint/libfprint) master (1.94.100);
 everything outside `libfprint/drivers/goodixtls/` is stock.
 
-> **Status: builds, not yet tested on real hardware.** I wrote and reverse-engineered
-> this against my own machine's traffic, but I don't have a second 5F10 to confirm
-> enroll/verify accross devices. If you own one of these sensors, a testing report is
-> exactly what I'm after before this goes upstream - see [Testing](#testing).
+> **Status: no longer only my machine.** Three other people have run it, on a
+> MagicBook 2023 (GLO-G52), an X14 Plus (FMI-76) and a DRA-XX. More reports are still
+> what I'm after before this goes upstream - see [Testing](#testing).
 
 ## The sensor
 
@@ -32,6 +31,32 @@ goodix53x5 driver - see [Credits](#credits).
 | Laptops | HONOR MagicBook family |
 | Matcher | pure-C sigfm (FAST-9 + BRIEF-256 + RANSAC), no OpenCV |
 | Transport | goodixtls, TLS 1.2 PSK (OpenSSL) |
+
+## Per-device calibration
+
+Every 5F10 leaves the factory with its own operating point and keeps it in OTP: an
+analog offset for the read path, and a code that sets the integration time. Three
+entries of the config table the driver uploads carry it.
+
+Builds before this one shipped that table as it came off my laptop, so every other
+sensor ran at my operating point - on a DRA-XX, a baseline of 2993 counts where its own
+OTP asks for 2396. The driver reads the OTP during activation now and rewrites those
+three.
+
+Prints from an older build should survive. I checked first, since the gallery is raw
+frames: enrolled at my own DAC, then verified with the config forced to two other
+people's values. 11 of 14 through at one, 5 of 6 at the other, 11 of 14 for the control
+- one finger and that few touches, but nothing I could pick out. New enrollments also
+carry a stamp of the point they were taken at, so a later surprise turns up in the log
+instead of as a finger that quietly stops working.
+
+Re-enrolling is worth it anyway, just not for the reason you might think. The old print
+keeps working; what a fresh one gets you is a gallery recorded at the point your sensor
+is actually calibrated for, plus the stamp, so if recognition ever does go odd later
+there's something in the log to look at. How much better it is I honestly don't know -
+my own measurement couldn't tell the two apart.
+
+`GOODIX5F10_NO_OTP_PATCH=1` puts the sensor back on mine if you want to compare.
 
 ## The catch: per-device PSK
 
