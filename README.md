@@ -60,16 +60,23 @@ my own measurement couldn't tell the two apart.
 
 ## The catch: per-device PSK
 
-The 5F10 only speaks TLS, and only with a per-device PSK that the factory
-provisions. That key is not in this code and cannot be derived from scratch on
-Linux. On a dual-boot machine you can recover the one Windows already holds with
-the companion tool:
+The 5F10 only speaks TLS, and only with a per-device PSK the factory burns in.
+That key is not in this code and there's no way to derive it on Linux.
+
+Provisioning your own is out of scope on purpose. The one write path into the
+sensor bricks it if the payload is wrong, and there's no 5F10 firmware image
+anywhere to recover a bricked one - so the driver only ever reads the key that's
+already there, and never writes a key to it.
+
+That means the Windows install has to still be on the disk - dual-boot, or at
+least the partition left in place. Recover the key Windows already holds with the companion tool:
 
 -> **[goodix-5f10-psk](https://github.com/Sbenazar/goodix-5f10-psk)**
 
 It reads the key offline and read-only off the Windows partition and drops it at
 `/var/lib/fprint/goodix-5f10/psk`. Without that file the driver fails activation
-with a clear message telling you where to put it.
+with a clear message telling you where to put it. On a Linux-only machine there is
+no path around this.
 
 ## Build
 
