@@ -267,17 +267,16 @@ compute_descriptor(const uint8_t *img, int w, const OrbKeypoint *kp,
 static int
 hamming_dist(const uint8_t *a, const uint8_t *b)
 {
+  /* memcpy because the descriptors sit in a packed n_kp x 32 array with no
+   * alignment guarantee. */
+  uint64_t wa[DESC_BYTES / 8], wb[DESC_BYTES / 8];
   int dist = 0;
-  for (int i = 0; i < DESC_BYTES; i++)
-    {
-      uint8_t x = a[i] ^ b[i];
-      /* Brian Kernighan bit-count */
-      while (x)
-        {
-          dist++;
-          x &= (uint8_t)(x - 1u);
-        }
-    }
+
+  memcpy(wa, a, DESC_BYTES);
+  memcpy(wb, b, DESC_BYTES);
+  for (size_t i = 0; i < DESC_BYTES / 8; i++)
+    dist += __builtin_popcountll(wa[i] ^ wb[i]);
+
   return dist;
 }
 
