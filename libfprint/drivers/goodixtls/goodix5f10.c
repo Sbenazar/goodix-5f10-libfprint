@@ -84,11 +84,15 @@
 
 // Multi-frame capture per single finger press. The sensor patch is tiny (~5x4 mm), so a
 // single touch covers only a fraction of the finger pad and a verify touch that lands on an
-// uncovered zone misses entirely (the dominant FRR cause: misses score 0, not "weak"). A held
+// uncovered zone misses entirely (a miss scores 0, not "weak"; how much of the FRR that
+// accounts for I have not pinned down). A held
 // finger micro-shifts over ~1 s, so grabbing several back-to-back MCU_GET_IMAGE frames per
 // press yields slightly different patches. On verify this multiplies the chance one frame
-// overlaps the gallery (P(miss) ~ p^N); on enroll it widens gallery coverage. GET_IMAGE
-// rescans the sensor each call, so consecutive frames are genuinely fresh (no re-arm needed).
+// overlaps the gallery (P(miss) ~ p^N); on enroll it widens gallery coverage. The frames in a
+// burst are not equally useful though: the signal fades out over a few grabs and comes back,
+// and across 8 bursts of 24 only 57 frames carried a finger at all (mean brightness per
+// position in the burst). A washed-out frame still yields a full set
+// of keypoints off the noise, so frame quality can't be judged by the keypoint count.
 #define GOODIX5F10_VERIFY_FRAMES 6
 #define GOODIX5F10_ENROLL_FRAMES 3
 
@@ -159,7 +163,6 @@ struct _FpiDeviceGoodixTls5f10
   Goodix5f10Pix *calibration_img; // baseline (empty-sensor) frame, scan_w*scan_h
   GPtrArray     *capture_frames;  // 8-bit frames (guint8*, WIDTH*HEIGHT) from the current press
   guint          frames_target;   // how many frames to grab per press (enroll vs verify)
-  gboolean       rearm_between;    // GOODIX5F10_REARM: send NAV0 between burst frames (fallback)
   guint          baseline_retries; // consecutive no-signal baseline frames this press
 
   GPtrArray *enroll_images;       // array of guint8* (8-bit frames) kept in the gallery
@@ -806,22 +809,9 @@ enum capture_states {
   CAP_FDT_DOWN,
   CAP_GET_IMG,
   CAP_GET_IMG_REPEAT, // loop CAP_GET_IMG until frames_target frames are collected
-  CAP_REARM,          // optional NAV0 between burst frames (only if GOODIX5F10_REARM set)
   CAP_FDT_UP,
   CAP_NUM_STATES,
 };
-
-// Re-arm callback: after NAV0, go take the next burst frame (best-effort; ignore NAV0 error).
-static void
-after_rearm (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
-{
-  if (err)
-    {
-      fp_dbg ("capture: NAV0 re-arm error (ignored): %s", err->message);
-      g_error_free (err);
-    }
-  fpi_ssm_jump_to_state (ssm, CAP_GET_IMG);
-}
 
 static void
 on_baseline_img (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
@@ -941,7 +931,6 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
         self->baseline_retries = 0;
         if (self->frames_target == 0)
           self->frames_target = 1;
-        self->rearm_between = (g_getenv ("GOODIX5F10_REARM") != NULL);
       }
       goodix_send_query_mcu_state (dev, check_none_cmd, ssm);
       break;
@@ -965,18 +954,15 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
     case CAP_GET_IMG_REPEAT:
       {
-        // Grab more frames from the same press until we hit the target. GET_IMAGE rescans
-        // the sensor each call, so normally no FDT re-arm is needed (and re-arming FDT_DOWN on
-        // a held finger would block waiting for a down-edge that already happened). If the chip
-        // turns out to re-serve one buffer, GOODIX5F10_REARM inserts a NAV0 between grabs.
+        // Grab more frames from the same press until we hit the target. Don't re-arm between
+        // grabs: FDT_DOWN on a held finger would block waiting for a down-edge that already
+        // happened, and a NAV0 in here costs far more than it looks - it stops the signal from
+        // recovering mid-burst: 57 usable frames across 8 bursts of 24 without it, 10 with.
         if (self->capture_frames->len < self->frames_target)
-          fpi_ssm_jump_to_state (ssm, self->rearm_between ? CAP_REARM : CAP_GET_IMG);
+          fpi_ssm_jump_to_state (ssm, CAP_GET_IMG);
         else
           fpi_ssm_jump_to_state (ssm, CAP_FDT_UP);
       }
-      break;
-    case CAP_REARM:
-      goodix_send_nav_0 (dev, after_rearm, ssm);
       break;
     case CAP_FDT_UP:
       goodix_send_mcu_switch_to_fdt_up (dev, fdt, fdt_len, NULL, check_fdt_up_cmd, ssm);
