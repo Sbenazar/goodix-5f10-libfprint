@@ -60,35 +60,61 @@ my own measurement couldn't tell the two apart.
 
 ## The catch: per-device PSK
 
-The 5F10 only speaks TLS, and only with a per-device PSK the factory burns in.
-That key is not in this code and there's no way to derive it on Linux.
+The 5F10 only speaks TLS, and only with a 32-byte PSK that the sensor and the host
+share. That key is not in this code. There are two ways to get one:
 
-Provisioning your own is out of scope on purpose. The one write path into the
-sensor bricks it if the payload is wrong, and there's no 5F10 firmware image
-anywhere to recover a bricked one - so the driver only ever reads the key that's
-already there, and never writes a key to it.
+- Windows is still on the disk (dual-boot, or at least the partition left in place):
+  recover the key it already holds. Nothing gets written to the sensor, so if you
+  can go this way, go this way.
+- Linux only: the driver can generate a key and write it to the sensor itself. It's
+  off unless you ask for it.
 
-That means the Windows install has to still be on the disk - dual-boot, or at
-least the partition left in place. Recover the key Windows already holds with the companion tool:
+Without a key file the driver fails activation with a message that says what to do.
+
+### Windows + Linux: recover the key
 
 -> **[goodix-5f10-psk](https://github.com/Sbenazar/goodix-5f10-psk)**
 
 It reads the key offline and read-only off the Windows partition and drops it at
-`/var/lib/fprint/goodix-5f10/psk`. Without that file the driver fails activation
-with a clear message telling you where to put it. On a Linux-only machine there is
-no path around this (unless you opt in to Linux-side provisioning, below).
+`/var/lib/fprint/goodix-5f10/psk`.
 
-## Optional: provisioning the key from Linux
+### Linux only: write your own key
 
-By default the driver only reads the key (see above). If you set `GOODIX5F10_AUTOPROVISION=1` for
-fprintd, it can also create one: when no key file exists it generates a key, writes it to the sensor and
-saves it to `/var/lib/fprint/goodix-5f10/psk`. If the stored key no longer matches the sensor, it is
-written again.
+Turn provisioning on for fprintd, enroll once, turn it off again:
 
-This writes to the sensor, so enable it deliberately. On dual-boot machines the Windows driver uses the
-same key slot (seen on one machine, see [issue #5](https://github.com/Sbenazar/goodix-5f10-libfprint/issues/5)).
-If you do not want Linux to write anything, recover the key from Windows with
-[goodix-5f10-psk](https://github.com/Sbenazar/goodix-5f10-psk) as described above.
+```sh
+sudo mkdir -p /etc/systemd/system/fprintd.service.d
+printf '[Service]\nEnvironment=GOODIX5F10_AUTOPROVISION=1\n' | \
+  sudo tee /etc/systemd/system/fprintd.service.d/provision.conf
+sudo systemctl daemon-reload
+sudo systemctl restart fprintd
+
+fprintd-enroll
+
+sudo rm /etc/systemd/system/fprintd.service.d/provision.conf
+sudo systemctl daemon-reload
+sudo systemctl restart fprintd
+```
+
+On that first open the driver generates a key, writes it with command `0xE0`, reads
+it back and saves it to `/var/lib/fprint/goodix-5f10/psk` once the read-back matches.
+
+Worth knowing before you do it:
+
+This replaces whatever key the sensor had. If you might still want the Windows one,
+recover it first.
+
+If a write bricks the sensor there's no way back: there's no 5F10 firmware image
+anywhere to recover it. So far this has been run on two machines, both on firmware
+`GF_ST411SEC_APP_12705`, and the driver refuses to write on anything else.
+
+Don't leave the variable set: with it on, any later mismatch rewrites the key without
+asking.
+
+On dual-boot the Windows driver uses the same key slot. On the one machine it was
+tried on ([issue #5](https://github.com/Sbenazar/goodix-5f10-libfprint/issues/5))
+booting Windows changed the key, and each side rewrote it on mismatch. Without the
+variable, on 12705 Linux just stops with an error naming the mismatch.
 
 ## Build
 
@@ -145,14 +171,14 @@ Keep backups outside the library path.
 ## Enroll & verify
 
 ```sh
-# 1. put the recovered PSK in place (see goodix-5f10-psk)
+# 1. have a key in place (see "The catch" above)
 sudo systemctl restart fprintd
 fprintd-enroll
 fprintd-verify
 ```
 
-Under SELinux fprintd also has to be allowed to read the PSK, or activation fails
-with a permission error:
+If you put the key there by hand, under SELinux fprintd also has to be allowed to
+read it, or activation fails with a permission error:
 
 ```sh
 sudo chown root:root /var/lib/fprint/goodix-5f10/psk
@@ -175,8 +201,8 @@ This is where you come in. I'm gathering reports before opening an upstream MR.
 If you have a 5F10:
 
 1. `lsusb | grep 27c6:5f10` to confirm the sensor.
-2. Recover the PSK with [goodix-5f10-psk](https://github.com/Sbenazar/goodix-5f10-psk).
-3. Build (above), enroll, verify.
+2. Build (above), then get a key one of the two ways described in "The catch".
+3. Enroll, verify.
 4. Paste your `G_MESSAGES_DEBUG=all fprintd` log into libfprint issue
    [#735](https://gitlab.freedesktop.org/libfprint/libfprint/-/issues/735), or open
    an issue here. Good or bad, both are useful.
@@ -191,6 +217,7 @@ This stands on a stack of prior work:
   [buxel](https://github.com/buxel/libfprint-27c6-5110), which in turn comes from
   the original sigfm authors (Matthieu Charette, Natasha England-Elbro, Timur
   Mangliev);
+- Linux-side key provisioning from [mounkastel](https://github.com/mounkastel);
 - the `FpDevice` host-side-matching **architecture** from
   [AndyHazz/goodix53x5-libfprint](https://github.com/AndyHazz/goodix53x5-libfprint).
 
