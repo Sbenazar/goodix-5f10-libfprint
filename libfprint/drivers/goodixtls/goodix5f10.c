@@ -28,9 +28,10 @@
 //     STRAIGHT (no transpose) with ridges inverted dark (see process_to_8bit).
 //
 // The TLS-PSK session key is a host-generated 32-byte secret: by default the
-// driver only loads it from disk, and a missing or mismatching key fails the
-// open. Setting GOODIX5F10_AUTOPROVISION=1 opts in to provisioning: the key is
-// then also written to the MCU with command 0xE0 at activation (see
+// driver only loads it from disk, and a missing key or (on firmware 12705) a
+// mismatching one fails the open. Setting GOODIX5F10_AUTOPROVISION=1 opts in to
+// provisioning: on 12705 the key is then also written to the MCU with command
+// 0xE0 at activation (see
 // goodix5f10_psk.[ch]). The 32-byte value the chip reports on a 0xE4 read is a
 // hash of the packed key; on the unit tested (FMI-76, firmware 12705) the chip
 // accepted a host-generated key and its read-back hash matched SHA256 of the
@@ -41,13 +42,10 @@
 #include "fpi-ssm.h"
 #include "gusb/gusb-device.h"
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <glib.h>
-#include <glib/gstdio.h>
 
 #include <openssl/ssl.h> // goodixtls.h references SSL/SSL_CTX types
 #include <openssl/crypto.h> // OPENSSL_cleanse: clear the session key on close
@@ -166,14 +164,15 @@ G_STATIC_ASSERT (GOODIX5F10_STAMP_LEN != GOODIX5F10_PIXELS);
 typedef guint16 Goodix5f10Pix;
 
 // Optional automatic provisioning, off by default: with
-// GOODIX5F10_AUTOPROVISION=1 the driver generates a 32-byte PSK and writes it
-// to the MCU during activation whenever there is no usable key on disk, or the
-// one on disk does not match the sensor. Without it nothing is ever written:
-// a missing or mismatching key fails the open instead.
+// GOODIX5F10_AUTOPROVISION=1 on firmware 12705 the driver generates a 32-byte
+// PSK and writes it to the MCU during activation whenever there is no usable
+// key on disk, or the one on disk does not match the sensor. Anywhere else
+// nothing is ever written.
 #define GOODIX_5F10_AUTOPROVISION_ENV "GOODIX5F10_AUTOPROVISION"
 
-// Length of the host-backup section in the 0xE0 payload. The MCU stores it
-// verbatim and never reads it, so any length works -- we just keep a fixed shape.
+// Length of the host-backup section in the 0xE0 payload: the size of the DPAPI
+// blob the Windows driver keeps in Goodix_Cache.bin. We fill it with random
+// bytes, the chip only hashes the TLV-1 body. I haven't tried other lengths.
 #define GOODIX_5F10_SEALED_LEN (324)
 
 struct _FpiDeviceGoodixTls5f10
@@ -216,6 +215,8 @@ struct _FpiDeviceGoodixTls5f10
   guint8     tls_psk[GOODIX_5F10_PSK_LEN];
   gchar     *psk_path;            // where tls_psk is (or will be) persisted
   gboolean   psk_from_disk;       // tls_psk came from an existing file
+  gboolean   autoprovision;       // GOODIX5F10_AUTOPROVISION=1 at open
+  gboolean   fw_tested;           // firmware is the one 0xE0 has been run on
 };
 
 G_DECLARE_FINAL_TYPE (FpiDeviceGoodixTls5f10, fpi_device_goodixtls5f10, FPI,
@@ -431,6 +432,8 @@ check_fdt_up_cmd (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError
 static void
 check_firmware (FpDevice *dev, gchar *firmware, gpointer ssm, GError *error)
 {
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+
   if (error) { fpi_ssm_mark_failed (ssm, error); return; }
   fp_dbg ("Device firmware: \"%s\"", firmware);
   if (!g_str_has_prefix (firmware, GOODIX_5F10_FIRMWARE_PREFIX))
@@ -439,7 +442,8 @@ check_firmware (FpDevice *dev, gchar *firmware, gpointer ssm, GError *error)
                                              "Invalid device firmware: \"%s\"", firmware));
       return;
     }
-  if (strcmp (firmware, GOODIX_5F10_FIRMWARE_VERSION) != 0)
+  self->fw_tested = strcmp (firmware, GOODIX_5F10_FIRMWARE_VERSION) == 0;
+  if (!self->fw_tested)
     fp_warn ("Device firmware \"%s\" is not the \"%s\" this driver was developed against; "
              "same family, but report anything that misbehaves",
              firmware, GOODIX_5F10_FIRMWARE_VERSION);
@@ -463,9 +467,7 @@ save_psk (const gchar *path, const guint8 psk[GOODIX_5F10_PSK_LEN],
           gboolean from_disk)
 {
   g_autofree gchar *dir = NULL;
-  gsize written = 0;
-  int fd;
-  int save_errno = 0;
+  g_autoptr (GError) error = NULL;
 
   // The directory is created 0700; an existing one is left as it is
   // (g_mkdir_with_parents only fails when it cannot reach the leaf).
@@ -473,47 +475,16 @@ save_psk (const gchar *path, const guint8 psk[GOODIX_5F10_PSK_LEN],
   if (g_mkdir_with_parents (dir, 0700) != 0)
     fp_warn ("could not create PSK dir \"%s\": %s", dir, g_strerror (errno));
 
-  // O_CREAT|O_TRUNC with 0600 up front: the file never momentarily exists
-  // readable by other users, which an open-then-chmod sequence would allow.
-  fd = g_open (path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-  if (fd < 0)
+  // Atomic and synced: by now the chip holds this key, and a crash halfway
+  // must not leave an empty file in place of it.
+  if (!g_file_set_contents_full (path, (const gchar *) psk, GOODIX_5F10_PSK_LEN,
+                                 G_FILE_SET_CONTENTS_CONSISTENT |
+                                 G_FILE_SET_CONTENTS_DURABLE,
+                                 0600, &error))
     {
       fp_warn ("the sensor is provisioned, but the key could not be saved to "
                "\"%s\": %s; record the raw 32 bytes yourself or the next open "
-               "will start over", path, g_strerror (errno));
-      return;
-    }
-
-  while (written < GOODIX_5F10_PSK_LEN)
-    {
-      const gssize chunk = write (fd, psk + written, GOODIX_5F10_PSK_LEN - written);
-
-      if (chunk < 0)
-        {
-          if (errno == EINTR)
-            continue;
-          save_errno = errno;
-          break;
-        }
-      if (chunk == 0)
-        {
-          // No progress is possible and write neither errors nor finishes;
-          // treat it as an error instead of looping forever.
-          save_errno = EIO;
-          break;
-        }
-      written += chunk;
-    }
-  close (fd);
-
-  if (written != GOODIX_5F10_PSK_LEN)
-    {
-      // save_errno is from the write, not from close(), which has already
-      // run. Either way the sensor still holds the key meanwhile.
-      fp_warn ("the sensor is provisioned, but the key could not be saved to "
-               "\"%s\" (wrote %u of %u bytes): %s; record the raw 32 bytes "
-               "yourself or the next open will start over", path, (guint) written,
-               (guint) GOODIX_5F10_PSK_LEN, g_strerror (save_errno));
+               "will start over", path, error->message);
       return;
     }
   if (from_disk)
@@ -587,13 +558,23 @@ check_preset_psk (FpDevice *dev, gboolean success, guint32 flags, guint8 *psk,
                   guint16 length, gpointer ssm, GError *error)
 {
   FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
-  const gboolean autoprovision =
-    goodix5f10_autoprovision_enabled (g_getenv (GOODIX_5F10_AUTOPROVISION_ENV));
+  const gboolean may_write = self->autoprovision && self->fw_tested;
 
   if (error) { fpi_ssm_mark_failed (ssm, error); return; }
 
+  // A freshly generated key is useless unless it can be written.
+  if (!self->psk_from_disk && !self->fw_tested)
+    {
+      fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+          "PSK provisioning has only been run on firmware \"%s\", not writing "
+          "to this sensor. Recover the Windows driver's key with the "
+          "goodix-5f10-psk companion tool instead.",
+          GOODIX_5F10_FIRMWARE_VERSION));
+      return;
+    }
+
   switch (goodix5f10_psk_decide (success, flags, length, psk, length,
-                                 self->tls_psk, autoprovision))
+                                 self->tls_psk, may_write))
     {
     case GOODIX5F10_PSK_MATCH:
       {
@@ -608,6 +589,15 @@ check_preset_psk (FpDevice *dev, gboolean success, guint32 flags, guint8 *psk,
       break;
 
     case GOODIX5F10_PSK_MISMATCH_FAIL:
+      if (!self->fw_tested)
+        {
+          // The hash formula is only confirmed on the tested firmware. Don't
+          // turn a possibly good key into a hard failure, let TLS decide.
+          fp_warn ("device PSK hash differs from the stored key, but that check "
+                   "is unconfirmed on this firmware; trying TLS anyway");
+          fpi_ssm_next_state (ssm);
+          return;
+        }
       {
         /* A wrong key can never complete TLS: fail here with the cause named,
          * instead of continuing into a handshake that dies as a timeout. The
@@ -635,17 +625,22 @@ check_preset_psk (FpDevice *dev, gboolean success, guint32 flags, guint8 *psk,
       }
 
     case GOODIX5F10_PSK_MISSING:
-    case GOODIX5F10_PSK_REPLY_INVALID:
-      if (autoprovision)
+      if (may_write)
         {
           fp_info ("sensor reports no usable PSK; provisioning one now");
           break;
         }
       fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-          "Unexpected PSK reply: success=%d flags=0x%08x len=%u. The driver "
-          "writes nothing until provisioning is opted in; set %s=1 to provision "
-          "a key automatically.", success, flags, length,
-          GOODIX_5F10_AUTOPROVISION_ENV));
+          "Sensor reports no readable PSK (flags=0x%08x len=%u) and provisioning "
+          "is off or untested on this firmware; nothing was written.",
+          flags, length));
+      return;
+
+    case GOODIX5F10_PSK_REPLY_INVALID:
+      // A reply we can't parse says nothing about the slot, so never write on it.
+      fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+          "Unexpected PSK reply: success=%d flags=0x%08x len=%u; nothing was "
+          "written.", success, flags, length));
       return;
 
     case GOODIX5F10_PSK_IO_ERROR:
@@ -1508,14 +1503,14 @@ static gboolean
 load_secrets (FpiDeviceGoodixTls5f10 *self, GError **error)
 {
   const gchar *psk_path = g_getenv (GOODIX_5F10_PSK_FILE_ENV);
-  const gboolean autoprovision =
-    goodix5f10_autoprovision_enabled (g_getenv (GOODIX_5F10_AUTOPROVISION_ENV));
   g_autofree gchar *data = NULL;
   gsize length = 0;
   g_autoptr (GError) inner = NULL;
 
   if (!psk_path) psk_path = GOODIX_5F10_DEFAULT_PSK_FILE;
   self->psk_path = g_strdup (psk_path);
+  self->autoprovision =
+    goodix5f10_autoprovision_enabled (g_getenv (GOODIX_5F10_AUTOPROVISION_ENV));
 
   if (g_file_get_contents (psk_path, &data, &length, &inner))
     {
@@ -1541,7 +1536,7 @@ load_secrets (FpiDeviceGoodixTls5f10 *self, GError **error)
 
   if (g_error_matches (inner, G_FILE_ERROR, G_FILE_ERROR_NOENT))
     {
-      if (!autoprovision)
+      if (!self->autoprovision)
         {
           g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
                        "goodixtls5f10: no TLS-PSK at \"%s\" and automatic "
