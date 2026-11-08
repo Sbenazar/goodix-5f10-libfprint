@@ -149,6 +149,8 @@ Fedora, and nothing ever picks it up (thanks @nexplorer-3e for that one):
 meson setup build -Dprefix=/usr -Dlibdir=/usr/lib64 -Ddoc=false -Dgtk-examples=false
 # Debian and Ubuntu
 meson setup build -Dprefix=/usr -Dlibdir=/usr/lib/x86_64-linux-gnu -Ddoc=false -Dgtk-examples=false
+# Arch
+meson setup build -Dprefix=/usr -Dlibdir=/usr/lib -Ddoc=false -Dgtk-examples=false -Dintrospection=false
 
 ninja -C build && sudo ninja -C build install
 ```
@@ -168,6 +170,10 @@ real one, and `ldconfig` is free to point `libfprint-2.so.2` at the backup - aft
 which you're running the old build and wondering why your changes do nothing.
 Keep backups outside the library path.
 
+If ninja stops with a PermissionError on `libfprint/fpi-enums.h`, root and non-root
+runs got mixed in the same `build/`. `rm -rf build` and set it up again (thanks
+@Eyeffect).
+
 ## Enroll & verify
 
 ```sh
@@ -185,6 +191,10 @@ sudo chown root:root /var/lib/fprint/goodix-5f10/psk
 sudo chcon -t fprintd_var_lib_t /var/lib/fprint/goodix-5f10/psk
 sudo systemctl restart fprintd
 ```
+
+On GNOME 51 the fingerprint option is gone from the login screen, and that's not this
+driver: GDM 51 only uses the sensor for re-authentication now (lock screen, sudo,
+polkit). Thanks @Eyeffect for tracing it.
 
 One thing to know before you reach for `examples/verify` instead: it asks which
 finger to verify *after* opening the device, and it reads that answer straight
