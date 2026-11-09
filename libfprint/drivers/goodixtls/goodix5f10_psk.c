@@ -24,6 +24,23 @@
 /*
  * Static material. Fixed constant of the sensor protocol; identical on every host.
  */
+
+/*
+ * kdf48: the 48-byte key block the vendor driver derives for the PSK-WB
+ * wrapper (Windows 5F10 driver, gfusb.dll 1.1.127.6; wrapper RVA 0x6BD0,
+ * KDF RVA 0x5B70).  The KDF is HMAC-SHA256 in counter mode over a fixed
+ * 32-byte seed block built from "Goodix" + 0A 0E 0D 06 16 04:
+ *
+ *   out = HMAC-SHA256(key_block, BE32(1) || "kgoodwixg\0" ||
+ *                     "kaelrgnoerlithm" || 00 00 01 80)
+ *       || HMAC-SHA256(key_block, BE32(2) || ...)
+ *   kdf48 = out[0:48]
+ *
+ * Bytes [0:32] are the AES-256-GCM key, [16:48] the outer HMAC-SHA256 key
+ * (16-byte overlap).  The same derivation/constant is used by the GDIX51C0
+ * vendor driver (gfspi.dll, FUN_180005b90), so this is a family-wide
+ * protocol constant, not a per-device secret.  It is not HKDF.
+ */
 static const guint8 kdf48[48] = {
   0x58, 0xf0, 0x13, 0xee, 0xb7, 0xe2, 0x16, 0xe2,
   0xc1, 0xcd, 0x0e, 0x8f, 0xff, 0xa7, 0xdb, 0xd6,
