@@ -980,9 +980,36 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
 }
 
 static void
+fail_dev_open (FpDevice *dev, gboolean deinit_dev, GError *error)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+  GUsbDevice *usb_dev = fpi_device_get_usb_device (dev);
+
+  g_clear_pointer (&self->psk_path, g_free);
+  OPENSSL_cleanse (self->tls_psk, sizeof (self->tls_psk));
+
+  if (deinit_dev)
+    {
+      goodix_tls_mark_session_dirty (dev);
+      goodix_reset_state (dev);
+      goodix_dev_deinit (dev, NULL);
+    }
+
+  if (usb_dev)
+    g_usb_device_close (usb_dev, NULL);
+
+  fpi_device_open_complete (dev, error);
+}
+
+static void
 open_tls_complete (FpDevice *dev, gpointer user_data, GError *error)
 {
-  fpi_device_open_complete (dev, error);
+  if (error)
+    {
+      fail_dev_open (dev, TRUE, error);
+      return;
+    }
+  fpi_device_open_complete (dev, NULL);
 }
 
 static void
@@ -994,7 +1021,7 @@ activate_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
   if (error)
     {
       fp_err ("failed during activation: %s", error->message);
-      fpi_device_open_complete (dev, error);
+      fail_dev_open (dev, TRUE, error);
       return;
     }
   // Bring up the real TLS-PSK channel; open completes when the handshake finishes.
@@ -1281,6 +1308,7 @@ enroll_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
   self->task_ssm = NULL;
   if (error)
     {
+      goodix_tls_mark_session_dirty (dev);
       g_clear_pointer (&self->enroll_images, g_ptr_array_unref);
       g_clear_pointer (&self->capture_frames, g_ptr_array_unref);
       fpi_device_enroll_complete (dev, NULL, error);
@@ -1480,6 +1508,8 @@ verify_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   self->task_ssm = NULL;
   g_clear_pointer (&self->capture_frames, g_ptr_array_unref);
+  if (error)
+    goodix_tls_mark_session_dirty (dev);
 
   if (action == FPI_DEVICE_ACTION_IDENTIFY)
     fpi_device_identify_complete (dev, error);
@@ -1595,14 +1625,14 @@ dev_open (FpDevice *dev)
 
   if (!load_secrets (self, &error))
     {
-      fpi_device_open_complete (dev, error);
+      fail_dev_open (dev, FALSE, error);
       return;
     }
 
   // goodix_dev_init() returns TRUE on success (it returns g_usb_device_claim_interface).
   if (!goodix_dev_init (dev, &error))
     {
-      fpi_device_open_complete (dev, error);
+      fail_dev_open (dev, FALSE, error);
       return;
     }
   // Feed the per-device TLS session PSK to the OpenSSL server callback.
@@ -1624,7 +1654,6 @@ dev_close (FpDevice *dev)
   g_clear_pointer (&self->psk_path, g_free);
 
   goodix_reset_state (dev);
-  goodix_shutdown_tls (dev, &error);
   goodix_dev_deinit (dev, &error);
 
   // TLS is down; do not leave the session key in the instance. The next open
