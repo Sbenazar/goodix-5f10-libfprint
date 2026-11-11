@@ -103,7 +103,9 @@
 // position in the burst). A washed-out frame still yields a full set
 // of keypoints off the noise, so frame quality can't be judged by the keypoint count.
 #define GOODIX5F10_VERIFY_FRAMES 6
+#define GOODIX5F10_HOLD_MAX_FRAMES 18
 #define GOODIX5F10_ENROLL_FRAMES 3
+#define GOODIX5F10_MIN_SIGNAL_SPAN 32
 
 // sigfm match gates:
 //   THRESHOLD  -- a per-sample sigfm score at/above this counts the sample as matching.
@@ -184,7 +186,13 @@ struct _FpiDeviceGoodixTls5f10
   Goodix5f10Pix *calibration_img; // baseline (empty-sensor) frame, scan_w*scan_h
   GPtrArray     *capture_frames;  // 8-bit frames (guint8*, WIDTH*HEIGHT) from the current press
   guint          frames_target;   // how many frames to grab per press (enroll vs verify)
+  guint          total_grabs;     // raw frame grabs attempted in the current press
+  guint          empty_streak;    // consecutive low-span grabs in the current press
   guint          baseline_retries; // consecutive no-signal baseline frames this press
+
+  GPtrArray     *verify_templates;   // pre-extracted gallery templates for streaming verify
+  gboolean       verify_matched;     // TRUE once a probe frame satisfied match gates
+  FpPrint       *verify_match_print; // matched print (weak pointer into action data)
 
   GPtrArray *enroll_images;       // array of guint8* (8-bit frames) kept in the gallery
 
@@ -417,6 +425,9 @@ check_fdt_down_cmd (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GErr
 {
   if (err) { fpi_ssm_mark_failed (ssm, err); return; }
   dump_fdt_reply ("down", data, len);
+  fpi_device_report_finger_status_changes (dev,
+                                           FP_FINGER_STATUS_PRESENT,
+                                           FP_FINGER_STATUS_NEEDED);
   fpi_ssm_next_state (ssm);
 }
 
@@ -1096,13 +1107,179 @@ on_baseline_img (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError 
   fpi_ssm_next_state (ssm);
 }
 
+typedef struct
+{
+  FpPrint   *print;
+  GPtrArray *samples;     // array of SigfmImgInfo*
+  int       *sample_best; // best score seen per gallery sample across probes
+} VerifyTemplate;
+
+static void
+verify_template_free (gpointer p)
+{
+  VerifyTemplate *vt = p;
+
+  if (!vt)
+    return;
+  g_clear_pointer (&vt->samples, g_ptr_array_unref);
+  g_free (vt->sample_best);
+  g_free (vt);
+}
+
+static gboolean
+is_enroll_action (FpDevice *dev)
+{
+  return fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL;
+}
+
+static void check_stamp (FpiDeviceGoodixTls5f10 *self, const guint8 *stamp);
+
+static VerifyTemplate *
+build_verify_template (FpiDeviceGoodixTls5f10 *self, FpPrint *print)
+{
+  GVariant *tdata = NULL;
+  VerifyTemplate *vt;
+  GVariantIter iter;
+  GVariant *child;
+
+  if (!print)
+    return NULL;
+  g_object_get (G_OBJECT (print), "fpi-data", &tdata, NULL);
+  if (!tdata)
+    return NULL;
+
+  vt = g_new0 (VerifyTemplate, 1);
+  vt->print = print;
+  vt->samples = g_ptr_array_new_with_free_func ((GDestroyNotify) sigfm_free_info);
+
+  g_variant_iter_init (&iter, tdata);
+  while ((child = g_variant_iter_next_value (&iter)))
+    {
+      gsize len = 0;
+      const guint8 *img = g_variant_get_fixed_array (child, &len, 1);
+
+      if (len == GOODIX5F10_STAMP_LEN && memcmp (img, "GX5F", 4) == 0)
+        check_stamp (self, img);
+      else if (len == GOODIX5F10_PIXELS)
+        {
+          SigfmImgInfo *ti = sigfm_extract_ex (img, GOODIX5F10_WIDTH,
+                                               GOODIX5F10_HEIGHT,
+                                               GOODIX5F10_SIGFM_MAX_KP);
+          if (ti)
+            g_ptr_array_add (vt->samples, ti);
+        }
+      g_variant_unref (child);
+    }
+  g_variant_unref (tdata);
+
+  vt->sample_best = g_new0 (int, MAX (vt->samples->len, 1));
+  return vt;
+}
+
+static void
+prepare_verify_templates (FpDevice *dev)
+{
+  FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+  FpiDeviceAction action = fpi_device_get_current_action (dev);
+
+  g_clear_pointer (&self->verify_templates, g_ptr_array_unref);
+  self->verify_templates = g_ptr_array_new_with_free_func (verify_template_free);
+  self->verify_matched = FALSE;
+  self->verify_match_print = NULL;
+
+  if (action == FPI_DEVICE_ACTION_IDENTIFY)
+    {
+      GPtrArray *gallery = NULL;
+
+      fpi_device_get_identify_data (dev, &gallery);
+      for (guint i = 0; gallery && i < gallery->len; i++)
+        {
+          FpPrint *tmpl = g_ptr_array_index (gallery, i);
+          VerifyTemplate *vt = build_verify_template (self, tmpl);
+          if (vt)
+            g_ptr_array_add (self->verify_templates, vt);
+        }
+    }
+  else
+    {
+      FpPrint *print = NULL;
+      VerifyTemplate *vt;
+
+      fpi_device_get_verify_data (dev, &print);
+      vt = build_verify_template (self, print);
+      if (vt)
+        g_ptr_array_add (self->verify_templates, vt);
+    }
+}
+
+static gboolean
+verify_templates_feed_probe (FpiDeviceGoodixTls5f10 *self, const guint8 *img)
+{
+  SigfmImgInfo *probe;
+  int best_overall = 0;
+  FpPrint *best_print = NULL;
+
+  if (!self->verify_templates || self->verify_templates->len == 0)
+    return FALSE;
+
+  probe = sigfm_extract_ex (img, GOODIX5F10_WIDTH, GOODIX5F10_HEIGHT,
+                            GOODIX5F10_SIGFM_MAX_KP);
+  if (!probe)
+    return FALSE;
+  if (sigfm_keypoints_count (probe) <= 0)
+    {
+      sigfm_free_info (probe);
+      return FALSE;
+    }
+
+  for (guint t = 0; t < self->verify_templates->len; t++)
+    {
+      VerifyTemplate *vt = g_ptr_array_index (self->verify_templates, t);
+      int best = 0;
+      int mc = 0;
+
+      for (guint s = 0; s < vt->samples->len; s++)
+        {
+          SigfmImgInfo *ti = g_ptr_array_index (vt->samples, s);
+          int score = sigfm_match_score (probe, ti);
+
+          if (score > vt->sample_best[s])
+            vt->sample_best[s] = score;
+          if (vt->sample_best[s] >= GOODIX5F10_SIGFM_THRESHOLD)
+            mc++;
+          if (vt->sample_best[s] > best)
+            best = vt->sample_best[s];
+        }
+
+      if (best >= GOODIX5F10_SIGFM_BEST_MIN &&
+          mc >= GOODIX5F10_SIGFM_MIN_SAMPLES &&
+          best > best_overall)
+        {
+          best_overall = best;
+          best_print = vt->print;
+        }
+    }
+
+  sigfm_free_info (probe);
+
+  if (best_overall >= GOODIX5F10_SIGFM_BEST_MIN)
+    {
+      self->verify_matched = TRUE;
+      self->verify_match_print = best_print;
+      return TRUE;
+    }
+
+  return FALSE;
+}
+
 static void
 on_capture_img (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
 {
   FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
+  gboolean enroll = is_enroll_action (dev);
 
   // Tolerate a read error once we already hold at least one frame: the finger was likely
-  // lifted mid-burst. Release with FDT_UP and proceed with what we collected.
+  // lifted mid-burst. Release with FDT_UP on enroll, or finish immediately on verify.
   if (err)
     {
       if (self->capture_frames && self->capture_frames->len > 0)
@@ -1110,7 +1287,10 @@ on_capture_img (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *
           fp_dbg ("capture: tolerated read error after %u frame(s): %s",
                   self->capture_frames->len, err->message);
           g_error_free (err);
-          fpi_ssm_jump_to_state (ssm, CAP_FDT_UP);
+          if (enroll)
+            fpi_ssm_jump_to_state (ssm, CAP_FDT_UP);
+          else
+            fpi_ssm_mark_completed (ssm);
           return;
         }
       fpi_ssm_mark_failed (ssm, err);
@@ -1122,7 +1302,10 @@ on_capture_img (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *
         {
           fp_dbg ("capture: tolerated short frame %u after %u frame(s)",
                   len, self->capture_frames->len);
-          fpi_ssm_jump_to_state (ssm, CAP_FDT_UP);
+          if (enroll)
+            fpi_ssm_jump_to_state (ssm, CAP_FDT_UP);
+          else
+            fpi_ssm_mark_completed (ssm);
           return;
         }
       fpi_ssm_mark_failed (ssm, g_error_new (FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
@@ -1131,16 +1314,44 @@ on_capture_img (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *
       return;
     }
 
+  self->total_grabs++;
+
   Goodix5f10Pix *raw = g_malloc0 (GOODIX5F10_PIXELS * sizeof (Goodix5f10Pix));
   decode_frame (raw, len, data);
   if (self->calibration_img)
     linear_subtract_inplace (raw, self->calibration_img, GOODIX5F10_PIXELS);
+
+  Goodix5f10Pix min = 0xffff, max = 0;
+  for (guint i = 0; i < GOODIX5F10_PIXELS; i++)
+    {
+      if (raw[i] < min) min = raw[i];
+      if (raw[i] > max) max = raw[i];
+    }
+  guint span = (max > min) ? (guint) (max - min) : 0;
+
+  if (span < GOODIX5F10_MIN_SIGNAL_SPAN)
+    {
+      g_free (raw);
+      self->empty_streak++;
+      fpi_ssm_next_state (ssm); // -> CAP_GET_IMG_REPEAT
+      return;
+    }
+
+  self->empty_streak = 0;
+
   guint8 *squashed = g_malloc0 (GOODIX5F10_PIXELS);
   squash_frame_linear (raw, squashed, GOODIX5F10_PIXELS);
   g_free (raw);
 
-  g_ptr_array_add (self->capture_frames, process_to_8bit (squashed));
+  guint8 *processed = process_to_8bit (squashed);
   g_free (squashed);
+  g_ptr_array_add (self->capture_frames, processed);
+
+  if (!enroll && verify_templates_feed_probe (self, processed))
+    {
+      fpi_ssm_mark_completed (ssm);
+      return;
+    }
 
   fpi_ssm_next_state (ssm); // -> CAP_GET_IMG_REPEAT
 }
@@ -1151,6 +1362,7 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
   FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
   const guint8 *fdt = self->fdt_base;
   const guint16 fdt_len = sizeof (self->fdt_base);
+  gboolean enroll = is_enroll_action (dev);
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
@@ -1158,6 +1370,8 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       {
         g_clear_pointer (&self->capture_frames, g_ptr_array_unref);
         self->capture_frames = g_ptr_array_new_with_free_func (g_free);
+        self->total_grabs = 0;
+        self->empty_streak = 0;
         self->baseline_retries = 0;
         if (self->frames_target == 0)
           self->frames_target = 1;
@@ -1171,28 +1385,43 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       goodix_send_mcu_switch_to_fdt_up (dev, fdt, fdt_len, NULL, check_fdt_up_cmd, ssm);
       break;
     case CAP_CAL_NAV0:
+      if (!enroll && self->calibration_img != NULL)
+        {
+          fpi_ssm_jump_to_state (ssm, CAP_FDT_DOWN);
+          break;
+        }
       goodix_send_nav_0 (dev, check_none_cmd, ssm);
       break;
     case CAP_CAL_GET_IMG:
       goodix_tls_read_image (dev, on_baseline_img, ssm);
       break;
     case CAP_FDT_DOWN:
+      fpi_device_report_finger_status_changes (dev,
+                                               FP_FINGER_STATUS_NEEDED,
+                                               FP_FINGER_STATUS_PRESENT);
       goodix_send_mcu_switch_to_fdt_down (dev, fdt, fdt_len, NULL, check_fdt_down_cmd, ssm);
       break;
     case CAP_GET_IMG:
       goodix_tls_read_image (dev, on_capture_img, ssm);
       break;
     case CAP_GET_IMG_REPEAT:
-      {
-        // Grab more frames from the same press until we hit the target. Don't re-arm between
-        // grabs: FDT_DOWN on a held finger would block waiting for a down-edge that already
-        // happened, and a NAV0 in here costs far more than it looks - it stops the signal from
-        // recovering mid-burst: 57 usable frames across 8 bursts of 24 without it, 10 with.
-        if (self->capture_frames->len < self->frames_target)
-          fpi_ssm_jump_to_state (ssm, CAP_GET_IMG);
-        else
-          fpi_ssm_jump_to_state (ssm, CAP_FDT_UP);
-      }
+      if (enroll)
+        {
+          if (self->total_grabs < self->frames_target)
+            fpi_ssm_jump_to_state (ssm, CAP_GET_IMG);
+          else
+            fpi_ssm_jump_to_state (ssm, CAP_FDT_UP);
+        }
+      else
+        {
+          gboolean lifted = (self->total_grabs >= GOODIX5F10_VERIFY_FRAMES &&
+                             self->empty_streak >= 2);
+
+          if (!lifted && self->total_grabs < GOODIX5F10_HOLD_MAX_FRAMES)
+            fpi_ssm_jump_to_state (ssm, CAP_GET_IMG);
+          else
+            fpi_ssm_mark_completed (ssm);
+        }
       break;
     case CAP_FDT_UP:
       goodix_send_mcu_switch_to_fdt_up (dev, fdt, fdt_len, NULL, check_fdt_up_cmd, ssm);
@@ -1375,45 +1604,6 @@ check_stamp (FpiDeviceGoodixTls5f10 *self, const guint8 *stamp)
              stamp[5], stamp[6], self->sent_dac, self->sent_tcode);
 }
 
-// Score a set of probe frames (all grabbed from one finger press) against one stored
-// template's gallery (a GVariant "aay"). Each gallery sample is extracted once and matched
-// against every probe frame; the sample's score is the best over probes. Returns the best
-// score across all samples and the count of samples scoring >= THRESHOLD.
-static int
-score_template_multi (FpiDeviceGoodixTls5f10 *self, SigfmImgInfo **probes, guint n_probes,
-                      GVariant *tmpl_data, int *out_match_count)
-{
-  GVariantIter iter;
-  GVariant *child;
-  int best = 0, count = 0;
-
-  g_variant_iter_init (&iter, tmpl_data);
-  while ((child = g_variant_iter_next_value (&iter)))
-    {
-      gsize len;
-      const guint8 *img = g_variant_get_fixed_array (child, &len, 1);
-      if (len == GOODIX5F10_STAMP_LEN && memcmp (img, "GX5F", 4) == 0)
-        check_stamp (self, img);
-      else if (len == GOODIX5F10_PIXELS)
-        {
-          SigfmImgInfo *ti = sigfm_extract_ex (img, GOODIX5F10_WIDTH, GOODIX5F10_HEIGHT, GOODIX5F10_SIGFM_MAX_KP);
-          int sample_best = 0;
-          for (guint p = 0; p < n_probes; p++)
-            {
-              if (!probes[p]) continue;
-              int score = sigfm_match_score (probes[p], ti);
-              if (score > sample_best) sample_best = score;
-            }
-          sigfm_free_info (ti);
-          if (sample_best >= GOODIX5F10_SIGFM_THRESHOLD) count++;
-          if (sample_best > best) best = sample_best;
-        }
-      g_variant_unref (child);
-    }
-  *out_match_count = count;
-  return best;
-}
-
 static void
 verify_run_state (FpiSsm *ssm, FpDevice *dev)
 {
@@ -1428,71 +1618,36 @@ verify_run_state (FpiSsm *ssm, FpDevice *dev)
     case VERIFY_MATCH:
       {
         FpiDeviceAction action = fpi_device_get_current_action (dev);
-
-        // Build a probe set from every frame grabbed during this press.
         guint n_probes = self->capture_frames ? self->capture_frames->len : 0;
-        SigfmImgInfo **probes = g_new0 (SigfmImgInfo *, MAX (n_probes, 1));
-        g_autoptr (GString) kp_line = g_string_new ("SIGFM probe frames keypoints:");
-        for (guint i = 0; i < n_probes; i++)
+
+        fpi_device_report_finger_status_changes (dev,
+                                                 FP_FINGER_STATUS_NONE,
+                                                 FP_FINGER_STATUS_NEEDED |
+                                                 FP_FINGER_STATUS_PRESENT);
+
+        if (n_probes == 0)
           {
-            guint8 *img = g_ptr_array_index (self->capture_frames, i);
-            probes[i] = sigfm_extract_ex (img, GOODIX5F10_WIDTH, GOODIX5F10_HEIGHT, GOODIX5F10_SIGFM_MAX_KP);
-            g_string_append_printf (kp_line, " %d", sigfm_keypoints_count (probes[i]));
+            GError *retry = fpi_device_retry_new (FP_DEVICE_RETRY_TOO_SHORT);
+
+            if (action == FPI_DEVICE_ACTION_IDENTIFY)
+              fpi_device_identify_report (dev, NULL, NULL, retry);
+            else
+              fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL, retry);
           }
-        fp_dbg ("%s", kp_line->str);
-
-        if (action == FPI_DEVICE_ACTION_IDENTIFY)
+        else if (action == FPI_DEVICE_ACTION_IDENTIFY)
           {
-            GPtrArray *gallery = NULL;
-            FpPrint *match = NULL;
-            int best_score = 0;
-
-            fpi_device_get_identify_data (dev, &gallery);
-            for (guint i = 0; gallery && i < gallery->len; i++)
-              {
-                FpPrint *tmpl = g_ptr_array_index (gallery, i);
-                GVariant *tdata = NULL;
-                g_object_get (G_OBJECT (tmpl), "fpi-data", &tdata, NULL);
-                if (!tdata) continue;
-                int mc = 0;
-                int best = score_template_multi (self, probes, n_probes, tdata, &mc);
-                g_variant_unref (tdata);
-                if (best >= GOODIX5F10_SIGFM_BEST_MIN &&
-                    mc >= GOODIX5F10_SIGFM_MIN_SAMPLES && best > best_score)
-                  {
-                    best_score = best;
-                    match = tmpl;
-                  }
-              }
-            fp_dbg ("identify best sigfm %d (%u probe frames)", best_score, n_probes);
-            fpi_device_identify_report (dev, match, NULL, NULL);
+            fpi_device_identify_report (dev,
+                                        self->verify_matched ? self->verify_match_print : NULL,
+                                        NULL, NULL);
           }
         else
           {
-            FpPrint *print = NULL;
-            GVariant *data = NULL;
-            int best = 0, mc = 0;
-
-            fpi_device_get_verify_data (dev, &print);
-            g_object_get (G_OBJECT (print), "fpi-data", &data, NULL);
-            if (data)
-              {
-                best = score_template_multi (self, probes, n_probes, data, &mc);
-                g_variant_unref (data);
-              }
-            fp_dbg ("verify best sigfm %d, matching samples %d over %u probe frames "
-                    "(thr %d/best %d/min %d)",
-                    best, mc, n_probes, GOODIX5F10_SIGFM_THRESHOLD,
-                    GOODIX5F10_SIGFM_BEST_MIN, GOODIX5F10_SIGFM_MIN_SAMPLES);
-            if (best >= GOODIX5F10_SIGFM_BEST_MIN && mc >= GOODIX5F10_SIGFM_MIN_SAMPLES)
-              fpi_device_verify_report (dev, FPI_MATCH_SUCCESS, NULL, NULL);
-            else
-              fpi_device_verify_report (dev, FPI_MATCH_FAIL, NULL, NULL);
+            fpi_device_verify_report (dev,
+                                      self->verify_matched ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
+                                      NULL, NULL);
           }
 
-        for (guint i = 0; i < n_probes; i++)
-          if (probes[i]) sigfm_free_info (probes[i]);
-        g_free (probes);
+        g_clear_pointer (&self->verify_templates, g_ptr_array_unref);
         g_clear_pointer (&self->capture_frames, g_ptr_array_unref);
         fpi_ssm_next_state (ssm);
       }
@@ -1507,7 +1662,12 @@ verify_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
   FpiDeviceAction action = fpi_device_get_current_action (dev);
 
   self->task_ssm = NULL;
+  g_clear_pointer (&self->verify_templates, g_ptr_array_unref);
   g_clear_pointer (&self->capture_frames, g_ptr_array_unref);
+  fpi_device_report_finger_status_changes (dev,
+                                           FP_FINGER_STATUS_NONE,
+                                           FP_FINGER_STATUS_NEEDED |
+                                           FP_FINGER_STATUS_PRESENT);
   if (error)
     goodix_tls_mark_session_dirty (dev);
 
@@ -1650,6 +1810,7 @@ dev_close (FpDevice *dev)
 
   g_clear_pointer (&self->calibration_img, g_free);
   g_clear_pointer (&self->capture_frames, g_ptr_array_unref);
+  g_clear_pointer (&self->verify_templates, g_ptr_array_unref);
   g_clear_pointer (&self->enroll_images, g_ptr_array_unref);
   g_clear_pointer (&self->psk_path, g_free);
 
@@ -1691,7 +1852,7 @@ dev_verify (FpDevice *dev)
   FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
 
   self->frames_target = GOODIX5F10_VERIFY_FRAMES;
-  g_clear_pointer (&self->calibration_img, g_free);
+  prepare_verify_templates (dev);
 
   self->task_ssm = fpi_ssm_new (dev, verify_run_state, VERIFY_NUM_STATES);
   fpi_ssm_start (self->task_ssm, verify_complete);
@@ -1703,7 +1864,7 @@ dev_identify (FpDevice *dev)
   FpiDeviceGoodixTls5f10 *self = FPI_DEVICE_GOODIXTLS5F10 (dev);
 
   self->frames_target = GOODIX5F10_VERIFY_FRAMES;
-  g_clear_pointer (&self->calibration_img, g_free);
+  prepare_verify_templates (dev);
 
   self->task_ssm = fpi_ssm_new (dev, verify_run_state, VERIFY_NUM_STATES);
   fpi_ssm_start (self->task_ssm, verify_complete);
