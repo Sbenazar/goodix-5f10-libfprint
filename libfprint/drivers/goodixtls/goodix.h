@@ -392,6 +392,8 @@ void goodix_send_reset (FpDevice           *dev,
                         GoodixResetCallback callback,
                         gpointer            user_data);
 
+void goodix_tls_mark_session_dirty (FpDevice *dev);
+
 /**
  * @brief Ask the device what firmware version it is running. Response is null-terminated string
  *

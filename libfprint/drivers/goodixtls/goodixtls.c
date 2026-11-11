@@ -173,14 +173,43 @@ goodix_tls_init_serve (void *me)
 gboolean
 goodix_tls_server_deinit (GoodixTlsServer *self, GError **error)
 {
-  SSL_shutdown (self->ssl_layer);
-  SSL_free (self->ssl_layer);
+  g_return_val_if_fail (self != NULL, FALSE);
 
-  close (self->client_fd);
-  close (self->sock_fd);
+  if (self->sock_fd >= 0)
+    shutdown (self->sock_fd, SHUT_RDWR);
+  if (self->client_fd >= 0)
+    shutdown (self->client_fd, SHUT_RDWR);
 
-  SSL_CTX_free (self->ssl_ctx);
-  pthread_join (self->serve_thread, NULL);
+  if (self->serve_thread_started)
+    {
+      pthread_join (self->serve_thread, NULL);
+      self->serve_thread_started = FALSE;
+    }
+
+  if (self->ssl_layer)
+    {
+      if (SSL_is_init_finished (self->ssl_layer))
+        SSL_shutdown (self->ssl_layer);
+      SSL_free (self->ssl_layer);
+      self->ssl_layer = NULL;
+    }
+
+  if (self->client_fd >= 0)
+    {
+      close (self->client_fd);
+      self->client_fd = -1;
+    }
+  if (self->sock_fd >= 0)
+    {
+      close (self->sock_fd);
+      self->sock_fd = -1;
+    }
+
+  if (self->ssl_ctx)
+    {
+      SSL_CTX_free (self->ssl_ctx);
+      self->ssl_ctx = NULL;
+    }
 
   return TRUE;
 }
@@ -188,36 +217,48 @@ goodix_tls_server_deinit (GoodixTlsServer *self, GError **error)
 gboolean
 goodix_tls_server_init (GoodixTlsServer *self, GError **error)
 {
+  self->ssl_ctx = NULL;
+  self->ssl_layer = NULL;
+  self->sock_fd = -1;
+  self->client_fd = -1;
+  self->serve_thread_started = FALSE;
+
   SSL_load_error_strings ();
   OpenSSL_add_ssl_algorithms ();
   SSL_library_init ();
   self->ssl_ctx = tls_server_create_ctx ();
+  if (self->ssl_ctx == NULL)
+    {
+      *error = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                         "Unable to create TLS server context");
+      return FALSE;
+    }
   tls_server_config_ctx (self->ssl_ctx);
 
-  int socks[2] = {0, 0};
+  int socks[2] = {-1, -1};
   if (socketpair (AF_UNIX, SOCK_STREAM, 0, socks) != 0)
     {
       g_set_error (error, G_FILE_ERROR, errno,
                    "failed to create socket pair: %s", strerror (errno));
+      SSL_CTX_free (self->ssl_ctx);
+      self->ssl_ctx = NULL;
       return FALSE;
     }
   self->sock_fd = socks[0];
   self->client_fd = socks[1];
 
-  if (self->ssl_ctx == NULL)
-    {
-      fp_dbg ("Unable to create TLS server context\n");
-      *error = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL, "Unable to "
-                                                                  "create TLS "
-                                                                  "server "
-                                                                  "context");
-      return FALSE;
-    }
   self->ssl_layer = SSL_new (self->ssl_ctx);
   tls_config_ssl (self->ssl_layer);
   SSL_set_fd (self->ssl_layer, self->sock_fd);
 
-  pthread_create (&self->serve_thread, 0, goodix_tls_init_serve, self);
+  if (pthread_create (&self->serve_thread, NULL, goodix_tls_init_serve, self) != 0)
+    {
+      g_set_error (error, G_FILE_ERROR, errno,
+                   "failed to start TLS server thread: %s", strerror (errno));
+      goodix_tls_server_deinit (self, NULL);
+      return FALSE;
+    }
+  self->serve_thread_started = TRUE;
 
   return TRUE;
 }
