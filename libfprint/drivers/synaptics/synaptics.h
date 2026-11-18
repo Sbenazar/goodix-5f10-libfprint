@@ -113,7 +113,6 @@ struct _FpiDeviceSynaptics
   FpiUsbTransfer       *cmd_pending_transfer;
   gboolean              cmd_complete_on_removal;
   gboolean              cmd_suspended;
-  guint8                id_idx;
 
   bmkt_sensor_version_t mis_version;
 
