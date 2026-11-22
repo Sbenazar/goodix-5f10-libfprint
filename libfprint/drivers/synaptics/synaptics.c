@@ -27,8 +27,6 @@
 
 G_DEFINE_TYPE (FpiDeviceSynaptics, fpi_device_synaptics, FP_TYPE_DEVICE)
 
-static void init_identify_msg (FpDevice *device);
-static void compose_and_send_identify_msg (FpDevice *device);
 
 static const FpIdEntry id_table[] = {
   { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00BD,  },
@@ -546,133 +544,6 @@ create_print (FpiDeviceSynaptics *self,
 }
 
 static void
-verify_complete_after_finger_removal (FpiDeviceSynaptics *self)
-{
-  FpDevice *device = FP_DEVICE (self);
-
-  if (self->finger_on_sensor)
-    {
-      fp_dbg ("delaying verify report until after finger removal!");
-      self->cmd_complete_on_removal = TRUE;
-    }
-  else
-    {
-      fpi_device_verify_complete (device, NULL);
-    }
-}
-
-static void
-verify_msg_cb (FpiDeviceSynaptics *self,
-               bmkt_response_t    *resp,
-               GError             *error)
-{
-  FpDevice *device = FP_DEVICE (self);
-  bmkt_verify_resp_t *verify_resp;
-
-  if (self->action_starting)
-    {
-      fpi_device_critical_leave (device);
-      self->action_starting = FALSE;
-    }
-
-  if (error)
-    {
-      fpi_device_verify_complete (device, error);
-      return;
-    }
-
-  if (resp == NULL && self->cmd_complete_on_removal)
-    {
-      fpi_device_verify_complete (device, NULL);
-      return;
-    }
-
-  g_assert (resp != NULL);
-
-  verify_resp = &resp->response.verify_resp;
-
-  switch (resp->response_id)
-    {
-    case BMKT_RSP_VERIFY_READY:
-      fpi_device_report_finger_status_changes (device,
-                                               FP_FINGER_STATUS_NEEDED,
-                                               FP_FINGER_STATUS_NONE);
-      fp_info ("Place Finger on the Sensor!");
-      break;
-
-    case BMKT_RSP_CAPTURE_COMPLETE:
-      fp_info ("Fingerprint image capture complete!");
-      break;
-
-    case BMKT_RSP_VERIFY_FAIL:
-      if (resp->result == BMKT_SENSOR_STIMULUS_ERROR)
-        {
-          fp_info ("Match error occurred");
-          fpi_device_verify_report (device, FPI_MATCH_ERROR, NULL,
-                                    fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
-          verify_complete_after_finger_removal (self);
-        }
-      else if (resp->result == BMKT_FP_NO_MATCH)
-        {
-          fp_info ("Print didn't match");
-          fpi_device_verify_report (device, FPI_MATCH_FAIL, NULL, NULL);
-          verify_complete_after_finger_removal (self);
-        }
-      else if (resp->result == BMKT_FP_DATABASE_NO_RECORD_EXISTS)
-        {
-          fp_info ("Print is not in database");
-          fpi_device_verify_complete (device,
-                                      fpi_device_error_new (FP_DEVICE_ERROR_DATA_NOT_FOUND));
-        }
-      else
-        {
-          fp_warn ("Verify has failed: %d", resp->result);
-          fpi_device_verify_complete (device,
-                                      fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
-                                                                "Unexpected result from device %d",
-                                                                resp->result));
-        }
-      break;
-
-    case BMKT_RSP_VERIFY_OK:
-      fp_info ("Verify was successful! for user: %s finger: %d score: %f",
-               verify_resp->user_id, verify_resp->finger_id, verify_resp->match_result);
-      fpi_device_verify_report (device, FPI_MATCH_SUCCESS, NULL, NULL);
-      verify_complete_after_finger_removal (self);
-      break;
-    }
-}
-
-static void
-verify (FpDevice *device)
-{
-  FpiDeviceSynaptics *self = FPI_DEVICE_SYNAPTICS (device);
-  FpPrint *print = NULL;
-
-  g_autoptr(GVariant) data = NULL;
-  guint8 finger;
-  const guint8 *user_id;
-  gsize user_id_len = 0;
-
-  fpi_device_get_verify_data (device, &print);
-
-  g_object_get (print, "fpi-data", &data, NULL);
-  g_debug ("data is %p", data);
-  if (!parse_print_data (data, &finger, &user_id, &user_id_len))
-    {
-      fpi_device_verify_complete (device,
-                                  fpi_device_error_new (FP_DEVICE_ERROR_DATA_INVALID));
-      return;
-    }
-
-  G_DEBUG_HERE ();
-
-  self->action_starting = TRUE;
-  fpi_device_critical_enter (device);
-  synaptics_sensor_cmd (self, 0, BMKT_CMD_VERIFY_USER, user_id, user_id_len, verify_msg_cb);
-}
-
-static void
 identify_complete_after_finger_removal (FpiDeviceSynaptics *self, GError *error)
 {
   FpDevice *device = FP_DEVICE (self);
@@ -722,14 +593,15 @@ identify_msg_cb (FpiDeviceSynaptics *self,
   switch (resp->response_id)
     {
     case BMKT_RSP_ID_READY:
+      fpi_device_report_finger_status_changes (device,
+                                               FP_FINGER_STATUS_NEEDED,
+                                               FP_FINGER_STATUS_NONE);
       fp_info ("Place Finger on the Sensor!");
       break;
 
-    case BMKT_RSP_SEND_NEXT_USER_ID:
-      {
-        compose_and_send_identify_msg (device);
-        break;
-      }
+    case BMKT_RSP_CAPTURE_COMPLETE:
+      fp_info ("Fingerprint image capture complete!");
+      break;
 
     case BMKT_RSP_ID_FAIL:
       if (resp->result == BMKT_SENSOR_STIMULUS_ERROR)
@@ -808,103 +680,15 @@ identify (FpDevice *device)
       return;
     }
 
+  G_DEBUG_HERE ();
+
+  /* Do not send the enrolled IDs: the sensor reports the ID of the template
+   * it matched, and that ID is then looked up in the gallery. */
   self->action_starting = TRUE;
   fpi_device_critical_enter (device);
-
-  init_identify_msg (device);
-  compose_and_send_identify_msg (device);
+  synaptics_sensor_cmd (self, 0, BMKT_CMD_ID_USER, NULL, 0, identify_msg_cb);
 }
 
-static void
-init_identify_msg (FpDevice *device)
-{
-  FpiDeviceSynaptics *self = FPI_DEVICE_SYNAPTICS (device);
-
-  self->id_idx = 0;
-}
-
-static void
-compose_and_send_identify_msg (FpDevice *device)
-{
-  FpiDeviceSynaptics *self = FPI_DEVICE_SYNAPTICS (device);
-  FpPrint *print = NULL;
-  GPtrArray *prints = NULL;
-
-  g_autoptr(GVariant) data = NULL;
-  guint8 finger;
-  const guint8 *user_id;
-  gsize user_id_len = 0;
-  g_autofree guint8 *payload = NULL;
-  guint8 payload_len = 0;
-  guint8 payloadOffset = 0;
-
-  fpi_device_get_identify_data (device, &prints);
-  if (prints->len > UINT8_MAX)
-    {
-      fpi_device_identify_complete (device,
-                                    fpi_device_error_new (FP_DEVICE_ERROR_DATA_INVALID));
-      return;
-    }
-  if(self->id_idx >= prints->len)
-    {
-      fp_warn ("Device asked for more prints than we are providing.");
-      fpi_device_identify_complete (device,
-                                    fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
-                                                              "Unexpected index"));
-      return;
-    }
-  print = g_ptr_array_index (prints, self->id_idx);
-  g_object_get (print, "fpi-data", &data, NULL);
-  g_debug ("data is %p", data);
-  if (!parse_print_data (data, &finger, &user_id, &user_id_len))
-    {
-      fpi_device_identify_complete (device,
-                                    fpi_device_error_new (FP_DEVICE_ERROR_DATA_INVALID));
-      return;
-    }
-  if(self->id_idx == 0)
-    {
-      /*
-       * Construct payload.
-       * 1st byte is total number of IDs in list.
-       * 2nd byte is number of IDs in list.
-       * 1 byte for each ID length, maximum id length is 100.
-       * user_id_len bytes of each ID
-       */
-      payload_len = 2 + 1 + user_id_len;
-      payload = g_malloc0 (payload_len);
-      payload[payloadOffset] = prints->len;
-      payloadOffset += 1;
-      payload[payloadOffset] = 1; /* send one id per message */
-      payloadOffset += 1;
-      payload[payloadOffset] = user_id_len;
-      payloadOffset += 1;
-      memcpy (&payload[payloadOffset], user_id, user_id_len);
-      payloadOffset += user_id_len;
-
-      G_DEBUG_HERE ();
-
-      synaptics_sensor_cmd (self, 0, BMKT_CMD_ID_USER_IN_ORDER, payload, payloadOffset, identify_msg_cb);
-    }
-  else
-    {
-      /*
-       * 1st byte is the number of IDs
-       * 1 byte for each ID length
-       * id_length bytes for each ID
-       */
-      payload_len = 1 + 1 + user_id_len;
-      payload = g_malloc0 (payload_len);
-      payload[payloadOffset] = 1; /* send one id per message */
-      payloadOffset += 1;
-      payload[payloadOffset] = user_id_len;
-      payloadOffset += 1;
-      memcpy (&payload[payloadOffset], user_id, user_id_len);
-      payloadOffset += user_id_len;
-      synaptics_sensor_cmd (self, self->cmd_seq_num, BMKT_CMD_ID_NEXT_USER, payload, payloadOffset, NULL);
-    }
-  self->id_idx++;
-}
 static void
 enroll_msg_cb (FpiDeviceSynaptics *self,
                bmkt_response_t    *resp,
@@ -1545,7 +1329,6 @@ fpi_device_synaptics_class_init (FpiDeviceSynapticsClass *klass)
   dev_class->open = dev_init;
   dev_class->close = dev_exit;
   dev_class->probe = dev_probe;
-  dev_class->verify = verify;
   dev_class->identify = identify;
   dev_class->enroll = enroll;
   dev_class->delete = delete_print;
